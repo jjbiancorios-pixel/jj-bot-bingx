@@ -143,6 +143,74 @@ def consultar_ordenes_abiertas(symbol: str = None) -> dict:
     return _get("/openApi/cswap/v1/trade/openOrders", params)
 
 
+def crear_orden_usdtm(symbol: str, side: str, position_side: str, tipo: str, quantity: float) -> dict:
+    """
+    13/09 — Contratos USDT-M (BTC-USDT, no BTC-USD), para las posiciones
+    CORTO (prohibido usar colateral cripto según el documento V4).
+    Endpoint por el mismo patrón que Coin-M pero bajo /openApi/swap/v2/
+    en vez de /openApi/cswap/v1/ — MENOS confirmado que Coin-M (no
+    encontré un ejemplo tan directo), verificar con /probar_bingx antes
+    de operar con capital real.
+    """
+    params = {
+        "symbol": symbol, "side": side, "positionSide": position_side,
+        "type": tipo, "quantity": quantity,
+    }
+    return _post("/openApi/swap/v2/trade/order", params)
+
+
+def consultar_balance_usdtm():
+    """GET /openApi/swap/v2/user/balance — balance de la cuenta USDT-M. Verificar con /probar_bingx."""
+    resp = _get("/openApi/swap/v2/user/balance", {})
+    try:
+        data = resp.get("data", {})
+        if isinstance(data, dict) and "balance" in data:
+            return float(data["balance"].get("balance", 0))
+        if isinstance(data, list):
+            for b in data:
+                if b.get("asset") == "USDT":
+                    return float(b.get("balance", 0))
+    except Exception as e:
+        print(f"⚠️ consultar_balance_usdtm: {e}")
+    return None
+
+
+def consultar_precio_usdtm(symbol: str):
+    """GET /openApi/swap/v2/quote/price — precio USDT-M. Verificar con /probar_bingx."""
+    resp = _get("/openApi/swap/v2/quote/price", {"symbol": symbol})
+    try:
+        data = resp.get("data", {})
+        precio = data.get("price")
+        return float(precio) if precio else None
+    except Exception as e:
+        print(f"⚠️ consultar_precio_usdtm({symbol}): {e}")
+        return None
+
+
+def cerrar_todas_posiciones_usdtm(symbol: str) -> dict:
+    """POST /openApi/swap/v2/trade/closeAllPositions"""
+    return _post("/openApi/swap/v2/trade/closeAllPositions", {"symbol": symbol})
+
+
+def cerrar_parcial_usdtm(symbol: str, position_side: str, quantity: float) -> dict:
+    side = "SELL" if position_side == "LONG" else "BUY"
+    params = {
+        "symbol": symbol, "side": side, "positionSide": position_side,
+        "type": "MARKET", "quantity": quantity, "reduceOnly": "true",
+    }
+    return _post("/openApi/swap/v2/trade/order", params)
+
+
+def consultar_velas_usdtm(symbol: str, interval: str = "1h", limit: int = 200):
+    """GET /openApi/swap/v3/quote/klines — velas USDT-M (público, sin firma). Verificar con /probar_bingx."""
+    url = f"{BASE_URL}/openApi/swap/v3/quote/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        return requests.get(url, timeout=10).json()
+    except Exception as e:
+        print(f"⚠️ consultar_velas_usdtm: {e}")
+        return {}
+
+
 def cerrar_todas_posiciones(symbol: str) -> dict:
     """POST /cswap/v1/trade/closeAllPositions — endpoint confirmado, cierra TODO en ese símbolo."""
     return _post("/openApi/cswap/v1/trade/closeAllPositions", {"symbol": symbol})

@@ -62,14 +62,16 @@ def _cmd_estado() -> str:
 
 
 def _cmd_pendientes() -> str:
-    ciclo = db.ciclo_abierto()
+    ciclos = db.ciclos_abiertos()
     sim = db.simulacion_abierta()
     lineas = []
-    if ciclo:
-        lineas.append(f"📋 <b>Ciclo real abierto</b>: {ciclo['moneda']} {ciclo['direccion']} ({ciclo['patron_tipo']})")
-        lineas.append(f"  Entrada {ciclo['n_entradas_actuales']}/5 | Promedio: {ciclo['precio_promedio_actual']:.2f} | TP: {ciclo['tp_actual']:.2f}")
+    if ciclos:
+        for ciclo in ciclos:
+            tp_txt = f"{ciclo['tp_actual']:.2f}" if ciclo['tp_actual'] else "sin calcular todavía"
+            lineas.append(f"📋 <b>{ciclo['moneda']} {ciclo['direccion']}</b> ({ciclo['contrato_tipo']})")
+            lineas.append(f"  Entrada {ciclo['n_entradas_actuales']}/5 | Entrada 1: {ciclo['precio_entrada_1']:.2f} | TP (VPVR): {tp_txt}")
     else:
-        lineas.append("✅ Sin ciclo real abierto.")
+        lineas.append("✅ Sin ciclos reales abiertos.")
     if sim:
         lineas.append(f"\n🧪 <b>Simulación abierta</b>: {sim['moneda']} {sim['direccion']} ({sim['patron_tipo']}) | TP objetivo: {sim['tp_objetivo_original']:.2f}")
     return "\n".join(lineas)
@@ -98,18 +100,17 @@ def _cmd_reanudar_todo() -> str:
 
 
 def _cmd_probar_bingx(args: list) -> str:
-    if not args:
-        return "Uso: /probar_bingx MONEDA\nEj: /probar_bingx BTC"
-    moneda = args[0].upper()
+    moneda = (args[0].upper() if args else "ETH")
     try:
         import bingx_api
-        contrato = bingx_api.consultar_contrato(f"{moneda}-USD")
-        precio = bingx_api.consultar_precio(f"{moneda}-USD")
-        balance = bingx_api.consultar_balance(moneda)
+        contrato_coinm = bingx_api.consultar_contrato(f"{moneda}-USD")
+        precio_coinm = bingx_api.consultar_precio(f"{moneda}-USD")
+        balance_coinm = bingx_api.consultar_balance(moneda)
+        precio_usdtm = bingx_api.consultar_precio_usdtm(f"{moneda}-USDT")
+        balance_usdtm = bingx_api.consultar_balance_usdtm()
         return (f"🧪 <b>Prueba BingX — {moneda}</b>\n"
-                f"Contrato: <code>{contrato}</code>\n"
-                f"Precio: {precio}\n"
-                f"Balance: {balance}")
+                f"<b>Coin-M</b> — Contrato: <code>{contrato_coinm}</code>\nPrecio: {precio_coinm} | Balance: {balance_coinm}\n\n"
+                f"<b>USDT-M</b> — Precio: {precio_usdtm} | Balance: {balance_usdtm}")
     except Exception as e:
         return f"⚠️ Error al conectar con BingX: {e}"
 
@@ -127,10 +128,11 @@ def _cmd_gates(args: list) -> str:
     conn.close()
     if not filas:
         return "Sin registros de gates todavía."
-    lineas = ["🔍 <b>Últimos chequeos (BingX)</b>"]
+    lineas = ["🔍 <b>Últimos chequeos (BingX V4)</b>"]
     for f in filas:
-        patron = f["patron_tipo"] or "sin figura"
-        lineas.append(f"{f['fecha']} {f['hora']} | {f['moneda']} | {patron} | ADX:{f['adx']:.1f} RSI:{f['rsi']:.1f} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+        dc = f["direccion_candidata"] or "sin dirección"
+        detalle = f"ATR:{'✅' if f['paso_atr_vela'] else '❌'} RSI:{'✅' if f['paso_rsi'] else '❌'} BB:{'✅' if f['paso_bollinger'] else '❌'}"
+        lineas.append(f"{f['fecha']} {f['hora']} | {dc} | {detalle} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
     return "\n".join(lineas)
 
 

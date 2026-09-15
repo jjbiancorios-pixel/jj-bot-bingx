@@ -98,6 +98,33 @@ def init_db():
         )
     """)
 
+    # 14/09 FIX CRÍTICO: gates_log ya existía de un diseño ANTERIOR de
+    # BingX (columnas: direccion, adx, rsi, paso_adx — sin
+    # direccion_candidata/paso_ema200/paso_atr_vela/paso_bollinger). El
+    # Volume persiste entre despliegues, así que CREATE TABLE IF NOT
+    # EXISTS no hacía nada — la tabla vieja seguía ahí, causando un
+    # KeyError repetido ('direccion_candidata') cada vez que el código
+    # nuevo intentaba leer una columna que nunca existió en esa tabla
+    # vieja. Se agregan las columnas nuevas si faltan.
+    for nombre, tipo in [("direccion_candidata", "TEXT"), ("paso_ema200", "INTEGER"),
+                         ("paso_atr_vela", "INTEGER"), ("paso_rsi", "INTEGER"),
+                         ("paso_bollinger", "INTEGER"), ("califico", "INTEGER")]:
+        try:
+            cur.execute(f"ALTER TABLE gates_log ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+
+    # 14/09: mismo resguardo para `ciclos` — pasó por 3 diseños
+    # distintos hoy (v2-doc -> V4 ATR -> colateral dual), cada uno con
+    # columnas propias. Cubre cualquier versión vieja que haya quedado
+    # en el Volume persistente.
+    for nombre, tipo in [("contrato_tipo", "TEXT"), ("atr_abs", "REAL"),
+                         ("hvn_precio", "REAL"), ("salida_parcial_hecha", "INTEGER")]:
+        try:
+            cur.execute(f"ALTER TABLE ciclos ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+
     cur.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
 
     conn.commit()

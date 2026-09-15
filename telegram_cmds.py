@@ -116,24 +116,31 @@ def _cmd_probar_bingx(args: list) -> str:
 
 
 def _cmd_gates(args: list) -> str:
-    import sqlite3
-    conn = sqlite3.connect(db.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    if args:
-        cur.execute("SELECT * FROM gates_log WHERE moneda = ? ORDER BY id DESC LIMIT 10", (args[0].upper(),))
-    else:
-        cur.execute("SELECT * FROM gates_log ORDER BY id DESC LIMIT 10")
-    filas = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    if not filas:
-        return "Sin registros de gates todavía."
-    lineas = ["🔍 <b>Últimos chequeos (BingX V4)</b>"]
-    for f in filas:
-        dc = f["direccion_candidata"] or "sin dirección"
-        detalle = f"ATR:{'✅' if f['paso_atr_vela'] else '❌'} RSI:{'✅' if f['paso_rsi'] else '❌'} BB:{'✅' if f['paso_bollinger'] else '❌'}"
-        lineas.append(f"{f['fecha']} {f['hora']} | {dc} | {detalle} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
-    return "\n".join(lineas)
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        if args:
+            cur.execute("SELECT * FROM gates_log WHERE moneda = ? ORDER BY id DESC LIMIT 10", (args[0].upper(),))
+        else:
+            cur.execute("SELECT * FROM gates_log ORDER BY id DESC LIMIT 10")
+        filas = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        if not filas:
+            return "Sin registros de gates todavía."
+        lineas = ["🔍 <b>Últimos chequeos (BingX V4)</b>"]
+        for f in filas:
+            dc = f["direccion_candidata"] or "sin dirección"
+            detalle = f"ATR:{'✅' if f['paso_atr_vela'] else '❌'} RSI:{'✅' if f['paso_rsi'] else '❌'} BB:{'✅' if f['paso_bollinger'] else '❌'}"
+            lineas.append(f"{f['fecha']} {f['hora']} | {dc} | {detalle} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+        return "\n".join(lineas)
+    except Exception as e:
+        # 14/09: antes, si esto tiraba una excepción, el comando no
+        # respondía NADA (silencio total) — ahora al menos avisa el
+        # motivo, en vez de parecer que el bot no escuchó el comando.
+        print(f"⚠️ _cmd_gates: {e}", flush=True)
+        return f"⚠️ Error al leer gates_log: {e}"
 
 
 def _cmd_informe(args: list) -> str:
@@ -179,7 +186,8 @@ def procesar_comando(texto: str) -> str:
             "/simulaciones [FECHA|todo] — resultados de la estrategia original (sin capital real)\n"
             "/gates [MONEDA] — últimos 10 chequeos (diagnóstico)\n"
             "/informe [FECHA|todo] — informe completo\n"
-            "/pausar_todo [motivo] / /reanudar_todo\n"
+            "/pausar_todo [motivo]\n"
+            "/reanudar_todo\n"
             "/probar_bingx MONEDA — prueba conexión sin operar real"
         )
     return f"⚠️ No reconozco el comando \"{cmd}\" — mandá /ayuda."

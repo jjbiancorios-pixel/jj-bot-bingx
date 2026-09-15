@@ -78,25 +78,30 @@ def _delete(path: str, params: dict = None) -> dict:
 
 
 def consultar_contrato(symbol: str) -> dict:
-    """GET /cswap/v1/quote/contracts — specs del contrato (mínimos, precisión). Endpoint confirmado."""
-    resp = _get("/openApi/cswap/v1/quote/contracts", {"symbol": symbol})
+    """
+    GET /cswap/v1/market/contracts — specs del contrato. FIX 14/09: el
+    endpoint real es /market/contracts, NO /quote/contracts (el que
+    tenía antes) — confirmado por la documentación oficial de BingX,
+    causaba respuesta vacía en producción.
+    """
+    resp = _get("/openApi/cswap/v1/market/contracts", {"symbol": symbol})
     data = resp.get("data", [])
     return data[0] if data else {}
 
 
 def consultar_precio(symbol: str):
     """
-    GET /cswap/v1/quote/ticker — precio actual. Endpoint NO confirmado
-    con la misma certeza que el resto (no apareció en la documentación
-    consultada con un ejemplo exacto) — VERIFICAR con /probar_bingx
-    antes de confiar en esto para abrir con capital real.
+    GET /cswap/v1/market/premiumIndex — precio de referencia (markPrice)
+    + funding rate. FIX 14/09: antes usaba /quote/ticker (no confirmado,
+    devolvía None en producción) — /market/premiumIndex SÍ está
+    confirmado en la documentación oficial.
     """
-    resp = _get("/openApi/cswap/v1/quote/ticker", {"symbol": symbol})
+    resp = _get("/openApi/cswap/v1/market/premiumIndex", {"symbol": symbol})
     try:
         data = resp.get("data", {})
         if isinstance(data, list):
             data = data[0] if data else {}
-        precio = data.get("lastPrice") or data.get("close") or data.get("price")
+        precio = data.get("markPrice") or data.get("indexPrice")
         return float(precio) if precio else None
     except Exception as e:
         print(f"⚠️ consultar_precio({symbol}): {e}")

@@ -28,10 +28,40 @@ NIVELES_ENTRADA_ATR = {
     5: {"largo": 12.0, "corto": 8.5},
 }
 
-SL_RETROCESO_LARGO_PCT = -51.6
-SL_RETROCESO_CORTO_PCT = 31.0
+SL_RETROCESO_LARGO_PCT = -51.6  # V4 (antigua) — precio crudo desde entrada 1
+SL_RETROCESO_CORTO_PCT = 31.0   # V4 (antigua)
+
+SL_MARGEN_PCT = -40.0  # V4.1 — sobre el margen TOTAL invertido (todas las entradas), no precio crudo
 
 TP_OFFSET_VPVR_PCT = 0.5
+
+
+def calcular_pnl_pct_margen(entradas: list, precio_actual: float, direccion: str, leverage: int) -> float:
+    """
+    V4.1 — PNL apalancado como % del margen TOTAL invertido (sumando
+    todas las entradas ejecutadas), no un % de retroceso de precio
+    crudo desde la 1ra entrada (que era V4).
+
+    Cada entrada aporta su propia ganancia/pérdida en USD según SU
+    PROPIO precio de entrada (no un promedio simplificado) — la suma
+    de esas ganancias en USD, dividida por el margen total invertido,
+    da el PNL% real sobre el margen.
+    """
+    signo = 1 if direccion == "LARGO" else -1
+    margen_total = sum(e["margen_usd"] for e in entradas)
+    if margen_total <= 0:
+        return 0.0
+    ganancia_usd_total = 0.0
+    for e in entradas:
+        cambio_pct = (precio_actual - e["precio"]) / e["precio"] * 100
+        ganancia_usd_total += (cambio_pct * signo * leverage / 100) * e["margen_usd"]
+    return round(ganancia_usd_total / margen_total * 100, 4)
+
+
+def precio_toca_sl_margen(entradas: list, precio_actual: float, direccion: str, leverage: int) -> bool:
+    """V4.1 — cierre inmediato si el PNL apalancado cae a -40% (o peor) del margen total invertido."""
+    pnl_pct = calcular_pnl_pct_margen(entradas, precio_actual, direccion, leverage)
+    return pnl_pct <= SL_MARGEN_PCT
 
 
 def calcular_promedio_ponderado(entradas: list):

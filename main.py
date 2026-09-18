@@ -90,6 +90,19 @@ def get_velas_1h(moneda, n=100):
     return None
 
 
+def get_velas_15m(moneda, n=100):
+    """17/09 — nuevo para V4.1: ATR/RSI/Bollinger pasan a calcularse en 15min, no 1h."""
+    symbol = f"{moneda}USDT"
+    for f, kw in ((_velas_binance, {"interval": "15m"}), (_velas_bybit, {"interval": "15"})):
+        try:
+            df = f(symbol, n, **kw)
+            if df is not None and len(df) >= 30:
+                return df
+        except Exception:
+            continue
+    return None
+
+
 def get_precio(moneda):
     try:
         r = requests.get(f"https://data-api.binance.vision/api/v3/ticker/price?symbol={moneda}USDT", timeout=6)
@@ -169,7 +182,7 @@ def calcular_vpvr_hvn(df, precio_actual, direccion, n_bins=24):
     return min(candidatos, key=lambda n: abs(n - precio_actual))
 
 
-# ── Gate de entrada: 4 condiciones juntas (Entrada 1) ────────
+# ── Gate de entrada V4 (ANTIGUA — queda solo para la simulación de comparación) ──
 def evaluar_entrada_v4(moneda: str):
     df4h = get_velas_4h(moneda, 250)
     df1h = get_velas_1h(moneda, 100)
@@ -183,21 +196,15 @@ def evaluar_entrada_v4(moneda: str):
     rsi_actual = rsi_serie.iloc[-1]
     banda_sup, banda_inf = calc_bollinger(df1h["close"], 20, 2)
 
-    # EMA200: define la dirección permitida
     permitido_largo = precio > ema200
     permitido_corto = precio < ema200
     direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
     if direccion_candidata is None:
         return None
 
-    ultima_vela = df1h.iloc[-1]
-    ventana_reciente = df1h.iloc[-6:-1]  # últimas 5 velas antes de la actual (misma ventana que el RSI)
+    ventana_reciente = df1h.iloc[-6:-1]
 
     if direccion_candidata == "LARGO":
-        # ATR: alguna vela bajista grande (>2x ATR) en la ventana reciente
-        # (el documento dice "gatillada TRAS vela bajista larga" — el
-        # proceso de confirmación con RSI/Bollinger llega en las velas
-        # siguientes, no necesariamente en la misma vela)
         cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
         paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 2 * atr_abs).any())
         tramo_reciente = rsi_serie.iloc[-6:-1]
@@ -211,6 +218,66 @@ def evaluar_entrada_v4(moneda: str):
         toco_sobrecompra = bool((tramo_reciente > 70).any())
         paso_rsi = toco_sobrecompra and rsi_actual < 70
         paso_bollinger = bool(df1h["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
+
+    califico = paso_atr_vela and paso_rsi and paso_bollinger
+    # 17/09: ya NO loguea en gates_log (eso queda reservado para V4.1,
+    # la principal ahora) — esta versión solo alimenta su propia
+    # simulación de comparación.
+    if not califico:
+        return None
+
+    return {
+        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
+        "atr_abs": round(atr_abs, 6), "df4h": df4h,
+    }
+
+
+# ── Gate de entrada V4.1 (NUEVA — principal) ─────────────────
+def evaluar_entrada_v41(moneda: str):
+    """
+    17/09 — Directiva V4.1, reemplaza a V4 como principal:
+    1. ATR/RSI/Bollinger ahora en 15min (antes 1h)
+    2. EMA200 se mantiene aislada en 4h (sin cambios)
+    3. Vela grande: techo bajado a >1.5x ATR (antes 2x), ventana de
+       5 velas de 15min (antes 1h)
+    4. SL cambia a control de margen flotante (-40% del margen total
+       invertido) — ver gestion_riesgo.precio_toca_sl_margen, se aplica
+       en el loop de riesgo, no acá en la entrada.
+    """
+    df4h = get_velas_4h(moneda, 250)
+    df15m = get_velas_15m(moneda, 200)
+    if df4h is None or df15m is None:
+        return None
+
+    precio = df15m["close"].iloc[-1]
+    ema200 = calc_ema(df4h["close"], 200).iloc[-1]
+    atr_abs = calc_atr(df15m, 14).iloc[-1]
+    rsi_serie = calc_rsi(df15m["close"], 14)
+    rsi_actual = rsi_serie.iloc[-1]
+    banda_sup, banda_inf = calc_bollinger(df15m["close"], 20, 2)
+
+    permitido_largo = precio > ema200
+    permitido_corto = precio < ema200
+    direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
+    if direccion_candidata is None:
+        return None
+
+    ventana_reciente = df15m.iloc[-6:-1]  # últimas 5 velas de 15min
+
+    if direccion_candidata == "LARGO":
+        cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
+        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 1.5 * atr_abs).any())
+        tramo_reciente = rsi_serie.iloc[-6:-1]
+        toco_sobreventa = bool((tramo_reciente < 30).any())
+        paso_rsi = toco_sobreventa and rsi_actual > 30
+        paso_bollinger = bool(df15m["close"].iloc[-2] < banda_inf.iloc[-2] and precio > banda_inf.iloc[-1])
+    else:
+        cuerpos_alcistas = ventana_reciente[ventana_reciente["close"] > ventana_reciente["open"]]
+        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_alcistas["close"] - cuerpos_alcistas["open"]) > 1.5 * atr_abs).any())
+        tramo_reciente = rsi_serie.iloc[-6:-1]
+        toco_sobrecompra = bool((tramo_reciente > 70).any())
+        paso_rsi = toco_sobrecompra and rsi_actual < 70
+        paso_bollinger = bool(df15m["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
 
     califico = paso_atr_vela and paso_rsi and paso_bollinger
     db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico)
@@ -392,16 +459,41 @@ def abrir_simulacion(candidato: dict):
 def ciclo_seleccion():
     pausado = db.esta_pausado_global()
 
+    # ── V4.1 (PRINCIPAL) — real si no está pausado ──
     try:
-        candidato = evaluar_entrada_v4(MONEDA)
+        candidato_v41 = evaluar_entrada_v41(MONEDA)
     except Exception as e:
-        print(f"Error analizando {MONEDA} (V4): {e}")
-        candidato = None
+        print(f"Error analizando {MONEDA} (V4.1): {e}")
+        candidato_v41 = None
 
-    if candidato and not pausado:
-        abrir_ciclo_real(candidato)  # el chequeo de duplicados por tipo de contrato ya está adentro
+    if candidato_v41 and not pausado:
+        abrir_ciclo_real(candidato_v41)
 
-    # Simulación paralela: SIEMPRE corre, sin importar la pausa
+    # ── "V4.1 fiel" — SIEMPRE recopila, sin importar la pausa
+    # (misma señal que la real, réplica exacta) ──
+    if candidato_v41 and not db.sim_ciclo_abierto("simulaciones_v41_fiel", MONEDA):
+        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v41["direccion"])
+        sim_id = db.sim_crear_ciclo("simulaciones_v41_fiel", MONEDA, candidato_v41["direccion"],
+                                     candidato_v41["precio_entrada"], candidato_v41["atr_abs"], capital_sim)
+        _ejecutar_entrada_simulada("simulaciones_v41_fiel", sim_id, MONEDA, candidato_v41["direccion"],
+                                    1, candidato_v41["precio_entrada"], capital_sim, candidato_v41["df4h"])
+
+    # ── V4 (antigua) — SIEMPRE recopila, sin importar la pausa,
+    # para comparar contra V4.1 ──
+    try:
+        candidato_v4 = evaluar_entrada_v4(MONEDA)
+    except Exception as e:
+        print(f"Error analizando {MONEDA} (V4 antigua): {e}")
+        candidato_v4 = None
+
+    if candidato_v4 and not db.sim_ciclo_abierto("simulaciones_v4_antigua", MONEDA):
+        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v4["direccion"])
+        sim_id = db.sim_crear_ciclo("simulaciones_v4_antigua", MONEDA, candidato_v4["direccion"],
+                                     candidato_v4["precio_entrada"], candidato_v4["atr_abs"], capital_sim)
+        _ejecutar_entrada_simulada("simulaciones_v4_antigua", sim_id, MONEDA, candidato_v4["direccion"],
+                                    1, candidato_v4["precio_entrada"], capital_sim, candidato_v4["df4h"])
+
+    # ── Simulación paralela ORIGINAL (canal/doble-triple techo): SIEMPRE corre ──
     try:
         sim_candidato = analizar_simulacion_original(MONEDA)
     except Exception as e:
@@ -409,6 +501,30 @@ def ciclo_seleccion():
         sim_candidato = None
     if sim_candidato and not db.simulacion_abierta(MONEDA):
         abrir_simulacion(sim_candidato)
+
+
+def _capital_estimado_para_simulacion(moneda: str, direccion: str) -> float:
+    """17/09 — capital de referencia para las simulaciones (mismo criterio que usaría una apertura real, sin depender de que haya capital real disponible ahora)."""
+    try:
+        if direccion == "LARGO":
+            cap = bingx_api.consultar_balance(moneda)
+        else:
+            cap = bingx_api.consultar_balance_usdtm()
+        return cap if cap else 100.0  # valor de referencia si no se pudo leer balance real
+    except Exception:
+        return 100.0
+
+
+def _ejecutar_entrada_simulada(tabla: str, sim_id: int, moneda: str, direccion: str, n_entrada: int,
+                                precio: float, capital_ciclo: float, df4h):
+    """17/09 — versión SIN capital real de _ejecutar_entrada, para las simulaciones de comparación."""
+    margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
+    db.sim_guardar_entrada(tabla, sim_id, n_entrada, precio, margen_usd)
+    db.sim_actualizar_entrada(tabla, sim_id, n_entrada)
+    hvn = calcular_vpvr_hvn(df4h, precio, direccion)
+    if hvn is not None:
+        tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn)
+        db.sim_actualizar_tp(tabla, sim_id, hvn, tp_nuevo)
 
 
 # ── Chequeo de riesgo — cada 30seg ───────────────────────────
@@ -429,12 +545,12 @@ def chequeo_riesgo():
                 contrato_tipo = ciclo["contrato_tipo"]
                 symbol = f"{MONEDA}-USD" if contrato_tipo == "COIN-M" else f"{MONEDA}-USDT"
 
-                if gestion_riesgo.precio_toca_sl(direccion, precio_1, precio_actual):
-                    resultado_pct = gestion_riesgo.SL_RETROCESO_LARGO_PCT if direccion == "LARGO" else -gestion_riesgo.SL_RETROCESO_CORTO_PCT
+                if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO):
+                    pnl_margen = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
                     if r.get("code") == 0:
-                        db.cerrar_ciclo(ciclo["id"], resultado_pct, "stop_loss")
-                        telegram_cmds.enviar(f"🔴 <b>{MONEDA} SL</b> ({contrato_tipo}) — ciclo cerrado. Resultado: {resultado_pct:+.2f}%")
+                        db.cerrar_ciclo(ciclo["id"], pnl_margen, "stop_loss_margen")
+                        telegram_cmds.enviar(f"🔴 <b>{MONEDA} SL (V4.1, por margen)</b> ({contrato_tipo}) — ciclo cerrado. PNL: {pnl_margen:+.2f}% del margen")
                     else:
                         print(f"⚠️ BingX rechazó el SL de {MONEDA} ({contrato_tipo}): {r}", flush=True)
                     continue
@@ -470,6 +586,37 @@ def chequeo_riesgo():
                     df4h = get_velas_4h(MONEDA, 250)
                     if df4h is not None:
                         _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h)
+
+            # ── 17/09: chequeo de las 2 simulaciones de comparación (V4 antigua y V4.1 fiel) ──
+            for tabla_sim, usa_sl_margen in (("simulaciones_v4_antigua", False), ("simulaciones_v41_fiel", True)):
+                for sim in db.sim_ciclos_abiertos(tabla_sim, MONEDA):
+                    precio_sim = get_precio(MONEDA)
+                    if precio_sim is None:
+                        continue
+                    direccion_sim = sim["direccion"]
+                    entradas_sim = db.sim_obtener_entradas(tabla_sim, sim["id"])
+
+                    if usa_sl_margen:
+                        cierra_sl = gestion_riesgo.precio_toca_sl_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
+                        resultado_sl = gestion_riesgo.calcular_pnl_pct_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
+                    else:
+                        cierra_sl = gestion_riesgo.precio_toca_sl(direccion_sim, sim["precio_entrada_1"], precio_sim)
+                        resultado_sl = gestion_riesgo.SL_RETROCESO_LARGO_PCT if direccion_sim == "LARGO" else -gestion_riesgo.SL_RETROCESO_CORTO_PCT
+
+                    if cierra_sl:
+                        db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_sl, "stop_loss")
+                        continue
+
+                    if sim["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion_sim, precio_sim, sim["tp_actual"]):
+                        resultado_tp = abs((precio_sim - sim["precio_entrada_1"]) / sim["precio_entrada_1"] * 100) * gestion_riesgo.LEVERAGE_FIJO
+                        db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_tp, "tp_vpvr")
+                        continue
+
+                    siguiente_n_sim = sim["n_entradas_actuales"] + 1
+                    if siguiente_n_sim <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion_sim, sim["precio_entrada_1"], sim["atr_abs"], precio_sim, siguiente_n_sim):
+                        df4h_sim = get_velas_4h(MONEDA, 250)
+                        if df4h_sim is not None:
+                            _ejecutar_entrada_simulada(tabla_sim, sim["id"], MONEDA, direccion_sim, siguiente_n_sim, precio_sim, sim["capital_ciclo"], df4h_sim)
 
             sim = db.simulacion_abierta(MONEDA)
             if sim:

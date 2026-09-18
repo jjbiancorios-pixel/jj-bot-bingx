@@ -88,6 +88,44 @@ def init_db():
         )
     """)
 
+    # 17/09 — Directiva V4.1: 2 ciclos-simulación nuevos, mismo
+    # esquema multi-entrada que `ciclos` (la real), para poder
+    # comparar V4 (antigua) y V4.1 (nueva, principal) entre sí y
+    # contra la real — recopilan SIEMPRE, sin importar la pausa.
+    for tabla_sim in ("simulaciones_v4_antigua", "simulaciones_v41_fiel"):
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {tabla_sim} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                moneda TEXT NOT NULL,
+                direccion TEXT NOT NULL,
+                precio_entrada_1 REAL,
+                atr_abs REAL,
+                capital_ciclo REAL,
+                n_entradas_actuales INTEGER DEFAULT 1,
+                hvn_precio REAL,
+                tp_actual REAL,
+                salida_parcial_hecha INTEGER DEFAULT 0,
+                fecha TEXT NOT NULL,
+                hora_inicio TEXT NOT NULL,
+                cerrado INTEGER DEFAULT 0,
+                resultado_pct REAL,
+                motivo_cierre TEXT,
+                fecha_cierre TEXT,
+                hora_cierre TEXT,
+                creado TEXT NOT NULL
+            )
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {tabla_sim}_entradas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sim_id INTEGER NOT NULL,
+                n_entrada INTEGER NOT NULL,
+                precio REAL NOT NULL,
+                margen_usd REAL NOT NULL,
+                creado TEXT NOT NULL
+            )
+        """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gates_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +319,123 @@ def resumen_ciclos(desde_fecha: str = None) -> dict:
     conn = _conn()
     cur = conn.cursor()
     query = "SELECT * FROM ciclos WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
+    params = ()
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params = (desde_fecha,)
+    cur.execute(query, params)
+    cerrados = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if not cerrados:
+        return {"n_cerrados": 0}
+    ganadores = [f for f in cerrados if f["resultado_pct"] > 0]
+    return {
+        "n_cerrados": len(cerrados), "n_ganadores": len(ganadores), "n_perdedores": len(cerrados) - len(ganadores),
+        "win_rate_pct": round(len(ganadores) / len(cerrados) * 100, 1),
+        "resultado_neto_pct": round(sum(f["resultado_pct"] for f in cerrados), 2),
+        "entradas_promedio": round(sum(f["n_entradas_actuales"] for f in cerrados) / len(cerrados), 1),
+    }
+
+
+# ── 17/09: funciones genéricas para simulaciones_v4_antigua y
+# simulaciones_v41_fiel — mismo esquema multi-entrada que `ciclos`,
+# reutilizado por nombre de tabla para no duplicar código. ──
+def sim_ciclo_abierto(tabla: str, moneda: str):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT * FROM {tabla} WHERE cerrado = 0 AND moneda = ? ORDER BY id DESC LIMIT 1", (moneda,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def sim_crear_ciclo(tabla: str, moneda, direccion, precio_entrada_1, atr_abs, capital_ciclo) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute(f"""
+        INSERT INTO {tabla} (moneda, direccion, precio_entrada_1, atr_abs, capital_ciclo, fecha, hora_inicio, creado)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (moneda, direccion, precio_entrada_1, atr_abs, capital_ciclo,
+          ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+    conn.commit()
+    sim_id = cur.lastrowid
+    conn.close()
+    return sim_id
+
+
+def sim_guardar_entrada(tabla: str, sim_id: int, n_entrada: int, precio: float, margen_usd: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"""
+        INSERT INTO {tabla}_entradas (sim_id, n_entrada, precio, margen_usd, creado)
+        VALUES (?,?,?,?,?)
+    """, (sim_id, n_entrada, precio, margen_usd, datetime.now(TZ_ARG).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def sim_obtener_entradas(tabla: str, sim_id: int) -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT * FROM {tabla}_entradas WHERE sim_id = ? ORDER BY n_entrada", (sim_id,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def sim_actualizar_entrada(tabla: str, sim_id: int, n_entradas_actuales: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {tabla} SET n_entradas_actuales = ? WHERE id = ?", (n_entradas_actuales, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def sim_actualizar_tp(tabla: str, sim_id: int, hvn_precio: float, tp_actual: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {tabla} SET hvn_precio = ?, tp_actual = ? WHERE id = ?", (hvn_precio, tp_actual, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def sim_marcar_salida_parcial(tabla: str, sim_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {tabla} SET salida_parcial_hecha = 1 WHERE id = ?", (sim_id,))
+    conn.commit()
+    conn.close()
+
+
+def sim_ciclos_abiertos(tabla: str, moneda: str = None) -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    if moneda:
+        cur.execute(f"SELECT * FROM {tabla} WHERE cerrado = 0 AND moneda = ?", (moneda,))
+    else:
+        cur.execute(f"SELECT * FROM {tabla} WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def sim_cerrar_ciclo(tabla: str, sim_id: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute(f"""
+        UPDATE {tabla} SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
+    conn.commit()
+    conn.close()
+
+
+def sim_resumen(tabla: str, desde_fecha: str = None) -> dict:
+    conn = _conn()
+    cur = conn.cursor()
+    query = f"SELECT * FROM {tabla} WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
         query += " AND fecha >= ?"

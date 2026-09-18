@@ -143,6 +143,31 @@ def _cmd_gates(args: list) -> str:
         return f"⚠️ Error al leer gates_log: {e}"
 
 
+def _cmd_comparar(args: list) -> str:
+    """17/09 — Directiva V4.1: compara real (V4.1 en vivo), V4.1 fiel (simulada, sin pausa), V4 antigua (simulada), y la simulación original (patrón)."""
+    desde_fecha = None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+
+    def _fmt(r):
+        if r.get("n_cerrados", r.get("n_cerradas", 0)) == 0:
+            return "sin cierres todavía"
+        n = r.get("n_cerrados", r.get("n_cerradas"))
+        return f"n={n} | win rate {r['win_rate_pct']}% | neto {r['resultado_neto_pct']:+.2f}%"
+
+    r_real = db.resumen_ciclos(desde_fecha)
+    r_v41_fiel = db.sim_resumen("simulaciones_v41_fiel", desde_fecha)
+    r_v4_antigua = db.sim_resumen("simulaciones_v4_antigua", desde_fecha)
+    r_original = db.resumen_simulaciones(desde_fecha)
+
+    return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
+            f"🔴 Real (V4.1, con capital): {_fmt(r_real)}\n\n"
+            f"👻 V4.1 fiel (sin pausa): {_fmt(r_v41_fiel)}\n\n"
+            f"📐 V4 antigua (comparación): {_fmt(r_v4_antigua)}\n\n"
+            f"🧪 Simulación original (patrón): {_fmt(r_original)}")
+
+
 def _cmd_informe(args: list) -> str:
     desde_fecha = None
     if args and args[0].lower() != "todo":
@@ -178,6 +203,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_gates(args)
     elif cmd == "/informe":
         return _cmd_informe(args)
+    elif cmd == "/comparar":
+        return _cmd_comparar(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot BingX — Comandos</b>\n\n"

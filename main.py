@@ -291,6 +291,74 @@ def evaluar_entrada_v41(moneda: str):
     }
 
 
+# ── Gate de entrada V5.0 (NUEVA — principal, reemplaza a V4.1) ──
+def evaluar_entrada_v5(moneda: str):
+    """
+    17/09 — Directiva V5.0: idéntica a V4.1 (15m, umbral 1,5x ATR, SL
+    por margen -40%, colateral dual en LARGO — ninguno de esos cambia)
+    + 1 gate NUEVO: Filtro BTC-Anchor — BTC también debe estar del
+    mismo lado de SU PROPIA EMA200 (4h), no solo ETH. V4.1 (sin este
+    filtro) queda corriendo sin tocar, como comparación.
+    """
+    df4h = get_velas_4h(moneda, 250)
+    df15m = get_velas_15m(moneda, 200)
+    if df4h is None or df15m is None:
+        return None
+
+    precio = df15m["close"].iloc[-1]
+    ema200 = calc_ema(df4h["close"], 200).iloc[-1]
+
+    permitido_largo = precio > ema200
+    permitido_corto = precio < ema200
+    direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
+    if direccion_candidata is None:
+        return None
+
+    # NUEVO — Filtro BTC-Anchor: BTC también del mismo lado de SU propia EMA200 (4h)
+    df4h_btc = get_velas_4h("BTC", 250)
+    if df4h_btc is None:
+        return None
+    precio_btc = df4h_btc["close"].iloc[-1]
+    ema200_btc = calc_ema(df4h_btc["close"], 200).iloc[-1]
+    btc_alineado = (precio_btc > ema200_btc) if direccion_candidata == "LARGO" else (precio_btc < ema200_btc)
+    if not btc_alineado:
+        return None
+
+    atr_abs = calc_atr(df15m, 14).iloc[-1]
+    rsi_serie = calc_rsi(df15m["close"], 14)
+    rsi_actual = rsi_serie.iloc[-1]
+    banda_sup, banda_inf = calc_bollinger(df15m["close"], 20, 2)
+
+    ventana_reciente = df15m.iloc[-6:-1]
+
+    if direccion_candidata == "LARGO":
+        cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
+        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 1.5 * atr_abs).any())
+        tramo_reciente = rsi_serie.iloc[-6:-1]
+        toco_sobreventa = bool((tramo_reciente < 30).any())
+        paso_rsi = toco_sobreventa and rsi_actual > 30
+        paso_bollinger = bool(df15m["close"].iloc[-2] < banda_inf.iloc[-2] and precio > banda_inf.iloc[-1])
+    else:
+        cuerpos_alcistas = ventana_reciente[ventana_reciente["close"] > ventana_reciente["open"]]
+        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_alcistas["close"] - cuerpos_alcistas["open"]) > 1.5 * atr_abs).any())
+        tramo_reciente = rsi_serie.iloc[-6:-1]
+        toco_sobrecompra = bool((tramo_reciente > 70).any())
+        paso_rsi = toco_sobrecompra and rsi_actual < 70
+        paso_bollinger = bool(df15m["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
+
+    califico = paso_atr_vela and paso_rsi and paso_bollinger
+    db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico)
+
+    if not califico:
+        return None
+
+    return {
+        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
+        "atr_abs": round(atr_abs, 6), "df4h": df4h,
+    }
+
+
+
 # ── Detectores VIEJOS (solo para la simulación, sin capital real) ──
 def detectar_canal(df, lookback=40, tolerancia_pct=0.5):
     ventana = df.iloc[-lookback:]
@@ -459,15 +527,30 @@ def abrir_simulacion(candidato: dict):
 def ciclo_seleccion():
     pausado = db.esta_pausado_global()
 
-    # ── V4.1 (PRINCIPAL) — real si no está pausado ──
+    # ── V5.0 (PRINCIPAL, 17/09) — real si no está pausado ──
+    try:
+        candidato_v5 = evaluar_entrada_v5(MONEDA)
+    except Exception as e:
+        print(f"Error analizando {MONEDA} (V5.0): {e}")
+        candidato_v5 = None
+
+    if candidato_v5 and not pausado:
+        abrir_ciclo_real(candidato_v5)
+
+    # ── "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa ──
+    if candidato_v5 and not db.sim_ciclo_abierto("simulaciones_v5_fiel", MONEDA):
+        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v5["direccion"])
+        sim_id = db.sim_crear_ciclo("simulaciones_v5_fiel", MONEDA, candidato_v5["direccion"],
+                                     candidato_v5["precio_entrada"], candidato_v5["atr_abs"], capital_sim)
+        _ejecutar_entrada_simulada("simulaciones_v5_fiel", sim_id, MONEDA, candidato_v5["direccion"],
+                                    1, candidato_v5["precio_entrada"], capital_sim, candidato_v5["df4h"])
+
+    # ── V4.1 (ahora COMPARACIÓN — sin filtro BTC-Anchor) — SIEMPRE recopila ──
     try:
         candidato_v41 = evaluar_entrada_v41(MONEDA)
     except Exception as e:
         print(f"Error analizando {MONEDA} (V4.1): {e}")
         candidato_v41 = None
-
-    if candidato_v41 and not pausado:
-        abrir_ciclo_real(candidato_v41)
 
     # ── "V4.1 fiel" — SIEMPRE recopila, sin importar la pausa
     # (misma señal que la real, réplica exacta) ──
@@ -588,7 +671,7 @@ def chequeo_riesgo():
                         _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h)
 
             # ── 17/09: chequeo de las 2 simulaciones de comparación (V4 antigua y V4.1 fiel) ──
-            for tabla_sim, usa_sl_margen in (("simulaciones_v4_antigua", False), ("simulaciones_v41_fiel", True)):
+            for tabla_sim, usa_sl_margen in (("simulaciones_v4_antigua", False), ("simulaciones_v41_fiel", True), ("simulaciones_v5_fiel", True)):
                 for sim in db.sim_ciclos_abiertos(tabla_sim, MONEDA):
                     precio_sim = get_precio(MONEDA)
                     if precio_sim is None:

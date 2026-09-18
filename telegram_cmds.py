@@ -144,7 +144,7 @@ def _cmd_gates(args: list) -> str:
 
 
 def _cmd_comparar(args: list) -> str:
-    """17/09 — Directiva V4.1: compara real (V4.1 en vivo), V4.1 fiel (simulada, sin pausa), V4 antigua (simulada), y la simulación original (patrón)."""
+    """17/09 — Directiva V5.0: compara real (V5.0 en vivo, con BTC-Anchor), V5.0 fiel, V4.1 fiel (sin BTC-Anchor), V4 antigua, y la simulación original (patrón)."""
     desde_fecha = None
     if args and args[0].lower() != "todo":
         desde_fecha = args[0]
@@ -157,13 +157,15 @@ def _cmd_comparar(args: list) -> str:
         return f"n={n} | win rate {r['win_rate_pct']}% | neto {r['resultado_neto_pct']:+.2f}%"
 
     r_real = db.resumen_ciclos(desde_fecha)
+    r_v5_fiel = db.sim_resumen("simulaciones_v5_fiel", desde_fecha)
     r_v41_fiel = db.sim_resumen("simulaciones_v41_fiel", desde_fecha)
     r_v4_antigua = db.sim_resumen("simulaciones_v4_antigua", desde_fecha)
     r_original = db.resumen_simulaciones(desde_fecha)
 
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
-            f"🔴 Real (V4.1, con capital): {_fmt(r_real)}\n\n"
-            f"👻 V4.1 fiel (sin pausa): {_fmt(r_v41_fiel)}\n\n"
+            f"🔴 Real (V5.0, con capital): {_fmt(r_real)}\n\n"
+            f"👻 V5.0 fiel — con BTC-Anchor (sin pausa): {_fmt(r_v5_fiel)}\n\n"
+            f"📜 V4.1 fiel — sin BTC-Anchor (comparación): {_fmt(r_v41_fiel)}\n\n"
             f"📐 V4 antigua (comparación): {_fmt(r_v4_antigua)}\n\n"
             f"🧪 Simulación original (patrón): {_fmt(r_original)}")
 

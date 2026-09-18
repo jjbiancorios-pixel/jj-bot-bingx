@@ -92,7 +92,7 @@ def init_db():
     # esquema multi-entrada que `ciclos` (la real), para poder
     # comparar V4 (antigua) y V4.1 (nueva, principal) entre sí y
     # contra la real — recopilan SIEMPRE, sin importar la pausa.
-    for tabla_sim in ("simulaciones_v4_antigua", "simulaciones_v41_fiel"):
+    for tabla_sim in ("simulaciones_v4_antigua", "simulaciones_v41_fiel", "simulaciones_v5_fiel"):
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {tabla_sim} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -657,6 +657,20 @@ def chequeo_riesgo():
                         print(f"⚠️ BingX rechazó el SL de {MONEDA} ({contrato_tipo}): {r}", flush=True)
                     continue
 
+                # 20/09 FIX: mismo problema que en las simulaciones —
+                # si el TP nunca se calculó, reintentarlo acá en cada
+                # chequeo (antes solo se calculaba al abrir una
+                # entrada nueva, y una posición real podía quedar
+                # ganando sin poder cerrar por TP indefinidamente).
+                if not ciclo["tp_actual"]:
+                    df4h_tp_real = get_velas_4h(MONEDA, 250)
+                    if df4h_tp_real is not None:
+                        hvn_retry_real = calcular_vpvr_hvn(df4h_tp_real, precio_actual, direccion)
+                        if hvn_retry_real is not None:
+                            tp_retry_real = gestion_riesgo.calcular_tp_vpvr(direccion, hvn_retry_real)
+                            db.actualizar_tp(ciclo["id"], hvn_retry_real, tp_retry_real)
+                            ciclo["tp_actual"] = tp_retry_real
+
                 if ciclo["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"]):
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
                     if r.get("code") == 0:
@@ -666,7 +680,6 @@ def chequeo_riesgo():
                     else:
                         print(f"⚠️ BingX rechazó el TP de {MONEDA} ({contrato_tipo}): {r}", flush=True)
                     continue
-
                 # 13/09: salida parcial (50% en breakeven del promedio), re-agregada a pedido de Juanjo
                 if ciclo["n_entradas_actuales"] >= gestion_riesgo.ENTRADA_ACTIVA_SALIDA_PARCIAL and not ciclo["salida_parcial_hecha"]:
                     entradas = db.obtener_entradas(ciclo["id"])
@@ -708,6 +721,23 @@ def chequeo_riesgo():
                     if cierra_sl:
                         db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_sl, "stop_loss")
                         continue
+
+                    # 20/09 FIX: si por algún motivo el TP nunca se
+                    # calculó (bug real de VPVR encontrado en
+                    # producción — posición de ETH en entrada 4/5, sin
+                    # TP por días, ya en ganancia sin poder cerrar),
+                    # reintentarlo ACÁ en cada chequeo — antes solo se
+                    # calculaba al ejecutar una entrada nueva, y una
+                    # posición que deja de sumar entradas (precio
+                    # revierte a favor) se quedaba sin TP para siempre.
+                    if not sim["tp_actual"]:
+                        df4h_tp = get_velas_4h(MONEDA, 250)
+                        if df4h_tp is not None:
+                            hvn_retry = calcular_vpvr_hvn(df4h_tp, precio_sim, direccion_sim)
+                            if hvn_retry is not None:
+                                tp_retry = gestion_riesgo.calcular_tp_vpvr(direccion_sim, hvn_retry)
+                                db.sim_actualizar_tp(tabla_sim, sim["id"], hvn_retry, tp_retry)
+                                sim["tp_actual"] = tp_retry
 
                     if sim["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion_sim, precio_sim, sim["tp_actual"]):
                         resultado_tp = abs((precio_sim - sim["precio_entrada_1"]) / sim["precio_entrada_1"] * 100) * gestion_riesgo.LEVERAGE_FIJO

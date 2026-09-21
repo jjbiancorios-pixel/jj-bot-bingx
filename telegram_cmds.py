@@ -72,8 +72,27 @@ def _cmd_pendientes() -> str:
             lineas.append(f"  Entrada {ciclo['n_entradas_actuales']}/5 | Entrada 1: {ciclo['precio_entrada_1']:.2f} | TP (VPVR): {tp_txt}")
     else:
         lineas.append("✅ Sin ciclos reales abiertos.")
+
+    # 20/09: visibilidad de las simulaciones en sombra (V4 antigua,
+    # V4.1 fiel, V5.0 fiel) — antes /pendientes no las mostraba nunca,
+    # sin forma de saber si tenían algo abierto mientras esperan cerrar.
+    etiquetas_sombra = {
+        "simulaciones_v4_antigua": "📐 V4 antigua",
+        "simulaciones_v41_fiel": "📜 V4.1 fiel (sin BTC-Anchor)",
+        "simulaciones_v5_fiel": "👻 V5.0 fiel (con BTC-Anchor)",
+    }
+    hubo_sombra = False
+    for tabla, etiqueta in etiquetas_sombra.items():
+        for sim_sombra in db.sim_ciclos_abiertos(tabla):
+            hubo_sombra = True
+            tp_txt = f"{sim_sombra['tp_actual']:.2f}" if sim_sombra['tp_actual'] else "sin calcular todavía"
+            lineas.append(f"\n{etiqueta}: <b>{sim_sombra['moneda']} {sim_sombra['direccion']}</b>")
+            lineas.append(f"  Entrada {sim_sombra['n_entradas_actuales']}/5 | Entrada 1: {sim_sombra['precio_entrada_1']:.2f} | TP (VPVR): {tp_txt}")
+    if not hubo_sombra:
+        lineas.append("\n(Sin posiciones abiertas en ninguna de las 3 simulaciones en sombra tampoco.)")
+
     if sim:
-        lineas.append(f"\n🧪 <b>Simulación abierta</b>: {sim['moneda']} {sim['direccion']} ({sim['patron_tipo']}) | TP objetivo: {sim['tp_objetivo_original']:.2f}")
+        lineas.append(f"\n🧪 <b>Simulación original abierta</b>: {sim['moneda']} {sim['direccion']} ({sim['patron_tipo']}) | TP objetivo: {sim['tp_objetivo_original']:.2f}")
     return "\n".join(lineas)
 
 

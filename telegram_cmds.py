@@ -189,6 +189,54 @@ def _cmd_comparar(args: list) -> str:
             f"🧪 Simulación original (patrón): {_fmt(r_original)}")
 
 
+def _cmd_corregir_historico() -> str:
+    """
+    20/09 — comando de UN SOLO USO: recalcula resultado_pct de los
+    cierres por TP que usaron la fórmula vieja (solo entrada 1, sin
+    ponderar las demás) — bug corregido en fix6. Back-deriva el precio
+    real de cierre a partir del resultado_pct guardado (con la fórmula
+    vieja) y precio_entrada_1, después recalcula con
+    calcular_pnl_pct_margen usando las entradas reales guardadas.
+    """
+    import sqlite3
+    import gestion_riesgo
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    tablas = [("ciclos", "entradas_ciclo", "ciclo_id"),
+              ("simulaciones_v5_fiel", "simulaciones_v5_fiel_entradas", "sim_id"),
+              ("simulaciones_v41_fiel", "simulaciones_v41_fiel_entradas", "sim_id"),
+              ("simulaciones_v4_antigua", "simulaciones_v4_antigua_entradas", "sim_id")]
+
+    corregidos = []
+    for tabla, tabla_entradas, campo_id in tablas:
+        cur.execute(f"SELECT * FROM {tabla} WHERE cerrado = 1 AND motivo_cierre = 'tp_vpvr'")
+        filas = [dict(r) for r in cur.fetchall()]
+        for f in filas:
+            cur.execute(f"SELECT precio, margen_usd FROM {tabla_entradas} WHERE {campo_id} = ?", (f["id"],))
+            entradas = [{"precio": e[0], "margen_usd": e[1]} for e in cur.fetchall()]
+            if len(entradas) <= 1:
+                continue  # 1 sola entrada -> la fórmula vieja ya daba el resultado correcto, nada que corregir
+
+            resultado_viejo = f["resultado_pct"]
+            precio_1 = f["precio_entrada_1"]
+            direccion = f["direccion"]
+            factor = resultado_viejo / (100 * gestion_riesgo.LEVERAGE_FIJO)
+            precio_cierre_estimado = precio_1 * (1 + factor) if direccion == "LARGO" else precio_1 * (1 - factor)
+
+            resultado_nuevo = gestion_riesgo.calcular_pnl_pct_margen(entradas, precio_cierre_estimado, direccion, gestion_riesgo.LEVERAGE_FIJO)
+            cur.execute(f"UPDATE {tabla} SET resultado_pct = ? WHERE id = ?", (resultado_nuevo, f["id"]))
+            corregidos.append(f"{tabla} #{f['id']}: {resultado_viejo:+.2f}% → {resultado_nuevo:+.2f}% (precio cierre estimado: {precio_cierre_estimado:.2f}, {len(entradas)} entradas)")
+
+    conn.commit()
+    conn.close()
+
+    if not corregidos:
+        return "✅ No se encontró ningún cierre por TP con más de 1 entrada para corregir."
+    return "🔧 <b>Corrección histórica aplicada</b>\n" + "\n".join(corregidos)
+
+
 def _cmd_ultimas(args: list) -> str:
     """20/09 — últimas operaciones cerradas, con detalle (motivo y % exacto), en las 5 estrategias."""
     n = 5
@@ -266,6 +314,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_comparar(args)
     elif cmd == "/ultimas":
         return _cmd_ultimas(args)
+    elif cmd == "/corregir_historico":
+        return _cmd_corregir_historico()
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot BingX — Comandos</b>\n\n"

@@ -154,6 +154,18 @@ def calcular_vpvr_hvn(df, precio_actual, direccion, n_bins=24):
     histograma. Devuelve el nodo más CERCANO al precio actual, del lado
     correcto (por encima para LARGO, por debajo para CORTO) — el TP se
     calcula 0.5% por dentro de ese nodo (gestion_riesgo.calcular_tp_vpvr).
+
+    20/09 FIX: los bins extremos (0 y n_bins-1) antes quedaban
+    SIEMPRE excluidos de poder ser "nodo" (el chequeo de máximo local
+    exigía vecino a los 2 lados). En una posición que viene cayendo
+    fuerte, el volumen más relevante suele concentrarse justo cerca
+    del precio actual — el extremo del rango — dejando el TP sin
+    calcular indefinidamente (encontrado en producción: posición real
+    de ETH en entrada 4/5, sin TP por varios ciclos). Ahora los
+    extremos SÍ pueden ser nodo, comparando contra su único vecino.
+    Además, si de verdad no hay ningún nodo en la dirección correcta,
+    usa el extremo del rango como respaldo — más vale un TP amplio
+    que ninguno.
     """
     precios = df["close"]
     volumenes = df["vol"]
@@ -168,18 +180,25 @@ def calcular_vpvr_hvn(df, precio_actual, direccion, n_bins=24):
         bins_volumen[idx] += v
 
     nodos = []
-    for i in range(1, n_bins - 1):
-        if bins_volumen[i] > bins_volumen[i - 1] and bins_volumen[i] > bins_volumen[i + 1] and bins_volumen[i] > 0:
+    for i in range(n_bins):
+        vol_izq = bins_volumen[i - 1] if i > 0 else -1
+        vol_der = bins_volumen[i + 1] if i < n_bins - 1 else -1
+        if bins_volumen[i] > vol_izq and bins_volumen[i] > vol_der and bins_volumen[i] > 0:
             precio_nodo = precio_min + (i + 0.5) * ancho_bin
             nodos.append(precio_nodo)
 
-    if not nodos:
-        return None
-
     candidatos = [n for n in nodos if n > precio_actual] if direccion == "LARGO" else [n for n in nodos if n < precio_actual]
-    if not candidatos:
-        return None
-    return min(candidatos, key=lambda n: abs(n - precio_actual))
+    if candidatos:
+        return min(candidatos, key=lambda n: abs(n - precio_actual))
+
+    # Respaldo: sin ningún nodo en la dirección correcta -> usar el
+    # extremo del rango como TP amplio, para que la posición nunca
+    # quede sin objetivo definido.
+    if direccion == "LARGO" and precio_max > precio_actual:
+        return precio_max
+    if direccion == "CORTO" and precio_min < precio_actual:
+        return precio_min
+    return None
 
 
 # ── Gate de entrada V4 (ANTIGUA — queda solo para la simulación de comparación) ──

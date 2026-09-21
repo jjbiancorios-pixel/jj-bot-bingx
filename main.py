@@ -744,6 +744,22 @@ def chequeo_riesgo():
                         db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_tp, "tp_vpvr")
                         continue
 
+                    # 20/09 — salida parcial (50% en breakeven del
+                    # promedio, desde la entrada 4), agregada a las
+                    # simulaciones en sombra — antes solo existía para
+                    # la posición real, así que no se reflejaba acá
+                    # (encontrado al revisar por qué un trade con 4
+                    # entradas no la había ejecutado). PENDIENTE: el
+                    # resultado final todavía no combina el 50%
+                    # cerrado acá con el 50% que sigue corriendo —
+                    # queda para una próxima actualización, igual que
+                    # en la real.
+                    if sim["n_entradas_actuales"] >= gestion_riesgo.ENTRADA_ACTIVA_SALIDA_PARCIAL and not sim["salida_parcial_hecha"]:
+                        promedio_sim = gestion_riesgo.calcular_promedio_ponderado(entradas_sim)
+                        if promedio_sim and gestion_riesgo.precio_recupero_promedio(direccion_sim, precio_sim, promedio_sim):
+                            db.sim_marcar_salida_parcial(tabla_sim, sim["id"])
+                            continue
+
                     siguiente_n_sim = sim["n_entradas_actuales"] + 1
                     if siguiente_n_sim <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion_sim, sim["precio_entrada_1"], sim["atr_abs"], precio_sim, siguiente_n_sim):
                         df4h_sim = get_velas_4h(MONEDA, 250)

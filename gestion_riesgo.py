@@ -24,8 +24,8 @@ ENTRADA_ACTIVA_SALIDA_PARCIAL = 4  # 13/09: re-agregado a pedido de Juanjo (se h
 NIVELES_ENTRADA_ATR = {
     2: {"largo": 1.5, "corto": 1.2},
     3: {"largo": 3.5, "corto": 2.8},
-    4: {"largo": 7.0, "corto": 5.5},
-    5: {"largo": 12.0, "corto": 8.5},
+    4: {"largo": 7.5, "corto": 6.0},   # V5.1 (20/09): antes 7.0/5.5 — estirado
+    5: {"largo": 14.0, "corto": 10.5},  # V5.1 (20/09): antes 12.0/8.5 — estirado
 }
 
 SL_RETROCESO_LARGO_PCT = -51.6  # V4 (antigua) — precio crudo desde entrada 1

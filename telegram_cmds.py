@@ -189,6 +189,44 @@ def _cmd_comparar(args: list) -> str:
             f"🧪 Simulación original (patrón): {_fmt(r_original)}")
 
 
+def _cmd_ultimas(args: list) -> str:
+    """20/09 — últimas operaciones cerradas, con detalle (motivo y % exacto), en las 5 estrategias."""
+    n = 5
+    if args and args[0].isdigit():
+        n = min(int(args[0]), 20)
+
+    def _filas(tabla_o_query, es_ciclos_real=False):
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        tabla = "ciclos" if es_ciclos_real else tabla_o_query
+        cur.execute(f"SELECT * FROM {tabla} WHERE cerrado = 1 AND resultado_pct IS NOT NULL ORDER BY id DESC LIMIT ?", (n,))
+        filas = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return filas
+
+    etiquetas = [
+        ("ciclos", "🔴 Real (V5.0, con capital)", True),
+        ("simulaciones_v5_fiel", "👻 V5.0 fiel", False),
+        ("simulaciones_v41_fiel", "📜 V4.1 fiel", False),
+        ("simulaciones_v4_antigua", "📐 V4 antigua", False),
+    ]
+
+    bloques = []
+    for tabla, etiqueta, es_real in etiquetas:
+        filas = _filas(tabla, es_real)
+        if not filas:
+            bloques.append(f"{etiqueta}: sin cierres todavía")
+            continue
+        lineas_detalle = []
+        for f in filas:
+            lineas_detalle.append(f"  {f['fecha_cierre']} {f['hora_cierre']} | {f['direccion']} | {f['motivo_cierre']} | {f['resultado_pct']:+.2f}%")
+        bloques.append(f"{etiqueta}:\n" + "\n".join(lineas_detalle))
+
+    return f"📋 <b>Últimas {n} operaciones cerradas, por estrategia</b>\n\n" + "\n\n".join(bloques)
+
+
 def _cmd_informe(args: list) -> str:
     desde_fecha = None
     if args and args[0].lower() != "todo":
@@ -226,6 +264,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_informe(args)
     elif cmd == "/comparar":
         return _cmd_comparar(args)
+    elif cmd == "/ultimas":
+        return _cmd_ultimas(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot BingX — Comandos</b>\n\n"

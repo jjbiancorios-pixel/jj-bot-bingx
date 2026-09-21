@@ -320,13 +320,17 @@ def procesar_comando(texto: str) -> str:
         return (
             "🤖 <b>Bot BingX — Comandos</b>\n\n"
             "/estado — resumen de hoy\n"
-            "/pendientes — posiciones abiertas\n"
+            "/pendientes — posiciones abiertas (real + las 3 simulaciones en sombra)\n"
             "/simulaciones [FECHA|todo] — resultados de la estrategia original (sin capital real)\n"
+            "/comparar [FECHA|todo] — las 5 estrategias juntas (real V5.0, V5.0 fiel, "
+            "V4.1 fiel, V4 antigua, simulación original)\n"
+            "/ultimas [N] — últimas N operaciones cerradas por estrategia, con detalle (motivo y % exacto)\n"
             "/gates [MONEDA] — últimos 10 chequeos (diagnóstico)\n"
             "/informe [FECHA|todo] — informe completo\n"
             "/pausar_todo [motivo]\n"
             "/reanudar_todo\n"
-            "/probar_bingx MONEDA — prueba conexión sin operar real"
+            "/probar_bingx MONEDA — prueba conexión sin operar real\n"
+            "/corregir_historico — uso puntual: recalcula cierres por TP que usaron la fórmula vieja (antes de fix6)"
         )
     return f"⚠️ No reconozco el comando \"{cmd}\" — mandá /ayuda."
 

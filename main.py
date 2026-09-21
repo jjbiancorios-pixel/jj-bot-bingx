@@ -674,7 +674,7 @@ def chequeo_riesgo():
                 if ciclo["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"]):
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
                     if r.get("code") == 0:
-                        resultado_pct = abs((precio_actual - precio_1) / precio_1 * 100) * gestion_riesgo.LEVERAGE_FIJO
+                        resultado_pct = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                         db.cerrar_ciclo(ciclo["id"], resultado_pct, "tp_vpvr")
                         telegram_cmds.enviar(f"🟢 <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado. Resultado: {resultado_pct:+.2f}%")
                     else:
@@ -740,7 +740,7 @@ def chequeo_riesgo():
                                 sim["tp_actual"] = tp_retry
 
                     if sim["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion_sim, precio_sim, sim["tp_actual"]):
-                        resultado_tp = abs((precio_sim - sim["precio_entrada_1"]) / sim["precio_entrada_1"] * 100) * gestion_riesgo.LEVERAGE_FIJO
+                        resultado_tp = gestion_riesgo.calcular_pnl_pct_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
                         db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_tp, "tp_vpvr")
                         continue
 

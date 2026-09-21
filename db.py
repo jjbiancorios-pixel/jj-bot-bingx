@@ -321,7 +321,7 @@ def resumen_ciclos(desde_fecha: str = None) -> dict:
     query = "SELECT * FROM ciclos WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params = (desde_fecha,)
     cur.execute(query, params)
     cerrados = [dict(r) for r in cur.fetchall()]
@@ -438,7 +438,7 @@ def sim_resumen(tabla: str, desde_fecha: str = None) -> dict:
     query = f"SELECT * FROM {tabla} WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params = (desde_fecha,)
     cur.execute(query, params)
     cerrados = [dict(r) for r in cur.fetchall()]
@@ -500,7 +500,7 @@ def resumen_simulaciones(desde_fecha: str = None) -> dict:
     query = "SELECT * FROM simulaciones WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params = (desde_fecha,)
     cur.execute(query, params)
     cerradas = [dict(r) for r in cur.fetchall()]

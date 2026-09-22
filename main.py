@@ -366,7 +366,7 @@ def evaluar_entrada_v5(moneda: str):
         paso_bollinger = bool(df15m["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
 
     califico = paso_atr_vela and paso_rsi and paso_bollinger
-    db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico)
+    db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico, estrategia="v5")
 
     if not califico:
         return None

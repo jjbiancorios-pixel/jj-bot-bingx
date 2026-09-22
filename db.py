@@ -146,7 +146,8 @@ def init_db():
     # vieja. Se agregan las columnas nuevas si faltan.
     for nombre, tipo in [("direccion_candidata", "TEXT"), ("paso_ema200", "INTEGER"),
                          ("paso_atr_vela", "INTEGER"), ("paso_rsi", "INTEGER"),
-                         ("paso_bollinger", "INTEGER"), ("califico", "INTEGER")]:
+                         ("paso_bollinger", "INTEGER"), ("califico", "INTEGER"),
+                         ("estrategia", "TEXT")]:
         try:
             cur.execute(f"ALTER TABLE gates_log ADD COLUMN {nombre} {tipo}")
         except Exception:
@@ -194,15 +195,15 @@ def esta_pausado_global() -> bool:
     return bool(row and row[0] == "1")
 
 
-def guardar_gates_log(moneda, direccion_candidata, paso_ema200, paso_atr_vela, paso_rsi, paso_bollinger, califico):
+def guardar_gates_log(moneda, direccion_candidata, paso_ema200, paso_atr_vela, paso_rsi, paso_bollinger, califico, estrategia="v41"):
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
-        INSERT INTO gates_log (moneda, direccion_candidata, fecha, hora, paso_ema200, paso_atr_vela, paso_rsi, paso_bollinger, califico, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO gates_log (moneda, direccion_candidata, fecha, hora, paso_ema200, paso_atr_vela, paso_rsi, paso_bollinger, califico, estrategia, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (moneda, direccion_candidata, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"),
-          int(paso_ema200), int(paso_atr_vela), int(paso_rsi), int(paso_bollinger), int(califico), ahora.isoformat()))
+          int(paso_ema200), int(paso_atr_vela), int(paso_rsi), int(paso_bollinger), int(califico), estrategia, ahora.isoformat()))
     conn.commit()
     conn.close()
 

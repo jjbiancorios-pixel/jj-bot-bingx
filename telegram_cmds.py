@@ -168,11 +168,12 @@ def _cmd_gates(args: list) -> str:
         conn.close()
         if not filas:
             return "Sin registros de gates todavía."
-        lineas = ["🔍 <b>Últimos chequeos (BingX V4)</b>"]
+        lineas = ["🔍 <b>Últimos chequeos</b>"]
         for f in filas:
             dc = f["direccion_candidata"] or "sin dirección"
+            etiqueta = f["estrategia"] or "v41"
             detalle = f"ATR:{'✅' if f['paso_atr_vela'] else '❌'} RSI:{'✅' if f['paso_rsi'] else '❌'} BB:{'✅' if f['paso_bollinger'] else '❌'}"
-            lineas.append(f"{f['fecha']} {f['hora']} | {dc} | {detalle} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+            lineas.append(f"{f['fecha']} {f['hora']} | [{etiqueta}] {dc} | {detalle} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
         return "\n".join(lineas)
     except Exception as e:
         # 14/09: antes, si esto tiraba una excepción, el comando no

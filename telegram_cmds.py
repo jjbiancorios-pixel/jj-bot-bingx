@@ -118,6 +118,22 @@ def _cmd_reanudar_todo() -> str:
     return "✅ Bot BingX reanudado."
 
 
+def _cmd_fijar_margen(args: list) -> str:
+    """20/09 — fija margen aislado AHORA, sin esperar a una entrada nueva (para confirmar que el endpoint de Coin-M funciona de verdad)."""
+    moneda = (args[0].upper() if args else "ETH")
+    try:
+        import bingx_api
+        r_coinm = bingx_api.fijar_margen_aislado(f"{moneda}-USD")
+        r_usdtm = bingx_api.fijar_margen_aislado_usdtm(f"{moneda}-USDT")
+        margen_coinm_after = bingx_api.consultar_margen_actual(f"{moneda}-USD")
+        margen_usdtm_after = bingx_api.consultar_margen_actual_usdtm(f"{moneda}-USDT")
+        return (f"🔧 <b>Fijar margen aislado — {moneda}</b>\n\n"
+                f"Coin-M — respuesta: <code>{r_coinm}</code>\nQuedó en: <code>{margen_coinm_after}</code>\n\n"
+                f"USDT-M — respuesta: <code>{r_usdtm}</code>\nQuedó en: <code>{margen_usdtm_after}</code>")
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+
+
 def _cmd_probar_bingx(args: list) -> str:
     moneda = (args[0].upper() if args else "ETH")
     try:
@@ -310,6 +326,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_reanudar_todo()
     elif cmd == "/probar_bingx":
         return _cmd_probar_bingx(args)
+    elif cmd == "/fijar_margen":
+        return _cmd_fijar_margen(args)
     elif cmd == "/gates":
         return _cmd_gates(args)
     elif cmd == "/informe":

@@ -266,6 +266,7 @@ def evaluar_entrada_v41(moneda: str):
     df4h = get_velas_4h(moneda, 250)
     df15m = get_velas_15m(moneda, 200)
     if df4h is None or df15m is None:
+        db.guardar_gates_log(moneda, "SIN_DATOS", 0, 0, 0, 0, False, estrategia="v41")
         return None
 
     precio = df15m["close"].iloc[-1]
@@ -279,6 +280,7 @@ def evaluar_entrada_v41(moneda: str):
     permitido_corto = precio < ema200
     direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
     if direccion_candidata is None:
+        db.guardar_gates_log(moneda, "SIN_DIRECCION_CLARA", 0, 0, 0, 0, False, estrategia="v41")
         return None
 
     ventana_reciente = df15m.iloc[-6:-1]  # últimas 5 velas de 15min
@@ -322,6 +324,7 @@ def evaluar_entrada_v5(moneda: str):
     df4h = get_velas_4h(moneda, 250)
     df15m = get_velas_15m(moneda, 200)
     if df4h is None or df15m is None:
+        db.guardar_gates_log(moneda, "SIN_DATOS", 0, 0, 0, 0, False, estrategia="v5")
         return None
 
     precio = df15m["close"].iloc[-1]
@@ -331,16 +334,19 @@ def evaluar_entrada_v5(moneda: str):
     permitido_corto = precio < ema200
     direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
     if direccion_candidata is None:
+        db.guardar_gates_log(moneda, "SIN_DIRECCION_CLARA", 0, 0, 0, 0, False, estrategia="v5")
         return None
 
     # NUEVO — Filtro BTC-Anchor: BTC también del mismo lado de SU propia EMA200 (4h)
     df4h_btc = get_velas_4h("BTC", 250)
     if df4h_btc is None:
+        db.guardar_gates_log(moneda, direccion_candidata, 0, 0, 0, 0, False, estrategia="v5")
         return None
     precio_btc = df4h_btc["close"].iloc[-1]
     ema200_btc = calc_ema(df4h_btc["close"], 200).iloc[-1]
     btc_alineado = (precio_btc > ema200_btc) if direccion_candidata == "LARGO" else (precio_btc < ema200_btc)
     if not btc_alineado:
+        db.guardar_gates_log(moneda, direccion_candidata, 0, 0, 0, 0, False, estrategia="v5")
         return None
 
     atr_abs = calc_atr(df15m, 14).iloc[-1]

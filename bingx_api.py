@@ -77,6 +77,16 @@ def _delete(path: str, params: dict = None) -> dict:
         return {}
 
 
+def consultar_margen_actual(symbol: str) -> dict:
+    """20/09 — GET Coin-M, consulta el modo de margen actual (para verificar, no cambiar). Mismo nivel de confirmación que fijar_margen_aislado."""
+    return _get("/openApi/cswap/v1/trade/marginType", {"symbol": symbol})
+
+
+def consultar_margen_actual_usdtm(symbol: str) -> dict:
+    """20/09 — GET USDT-M, consulta el modo de margen actual. Endpoint confirmado (mismo patrón que fijar_margen_aislado_usdtm)."""
+    return _get("/openApi/swap/v2/trade/marginType", {"symbol": symbol})
+
+
 def consultar_contrato(symbol: str) -> dict:
     """
     GET /cswap/v1/market/contracts — specs del contrato. FIX 14/09: el
@@ -124,6 +134,33 @@ def consultar_balance(moneda: str):
     except Exception as e:
         print(f"⚠️ consultar_balance({moneda}): {e}")
     return None
+
+
+def fijar_margen_aislado(symbol: str) -> dict:
+    """
+    20/09 — Fija margen AISLADO para Coin-M, a pedido de Juanjo (el
+    bot nunca lo configuraba, dependía de lo que estuviera puesto
+    manualmente en la cuenta). Endpoint MENOS confirmado que el de
+    crear orden — no encontré un ejemplo directo específico para
+    Coin-M, infiero el path por el mismo patrón que USDT-M (que sí
+    está confirmado). Verificar con /probar_bingx o mirando la
+    respuesta cruda la primera vez que se use con capital real.
+    Si BingX devuelve error porque ya hay una posición abierta (no se
+    puede cambiar el modo con posición viva) o porque ya está en
+    aislado, no es necesariamente un problema — igual se reporta.
+    """
+    params = {"symbol": symbol, "marginType": "ISOLATED"}
+    return _post("/openApi/cswap/v1/trade/marginType", params)
+
+
+def fijar_margen_aislado_usdtm(symbol: str) -> dict:
+    """
+    20/09 — Fija margen AISLADO para USDT-M. Endpoint CONFIRMADO
+    (múltiples fuentes independientes, incluida documentación oficial
+    referenciada por SDKs de terceros): POST /swap/v2/trade/marginType.
+    """
+    params = {"symbol": symbol, "marginType": "ISOLATED"}
+    return _post("/openApi/swap/v2/trade/marginType", params)
 
 
 def crear_orden(symbol: str, side: str, position_side: str, tipo: str, quantity: float) -> dict:

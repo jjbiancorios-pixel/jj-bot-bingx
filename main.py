@@ -507,9 +507,21 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
 
     if contrato_tipo == "COIN-M":
         symbol = f"{moneda}-USD"
+        if n_entrada == 1:
+            # 20/09: margen aislado, a pedido de Juanjo — solo tiene
+            # sentido en la 1ra entrada (con posición ya abierta,
+            # BingX rechaza el cambio de modo; no bloquea la entrada
+            # si falla, solo se reporta).
+            r_margen = bingx_api.fijar_margen_aislado(symbol)
+            if r_margen.get("code") != 0:
+                print(f"⚠️ No se pudo confirmar margen aislado (Coin-M) para {symbol}: {r_margen}", flush=True)
         resultado = bingx_api.crear_orden(symbol, side, position_side, "MARKET", quantity)
     else:
         symbol = f"{moneda}-USDT"
+        if n_entrada == 1:
+            r_margen = bingx_api.fijar_margen_aislado_usdtm(symbol)
+            if r_margen.get("code") != 0:
+                print(f"⚠️ No se pudo confirmar margen aislado (USDT-M) para {symbol}: {r_margen}", flush=True)
         resultado = bingx_api.crear_orden_usdtm(symbol, side, position_side, "MARKET", quantity)
 
     ok = resultado.get("code") == 0

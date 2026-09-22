@@ -127,9 +127,13 @@ def _cmd_probar_bingx(args: list) -> str:
         balance_coinm = bingx_api.consultar_balance(moneda)
         precio_usdtm = bingx_api.consultar_precio_usdtm(f"{moneda}-USDT")
         balance_usdtm = bingx_api.consultar_balance_usdtm()
+        margen_coinm = bingx_api.consultar_margen_actual(f"{moneda}-USD")
+        margen_usdtm = bingx_api.consultar_margen_actual_usdtm(f"{moneda}-USDT")
         return (f"🧪 <b>Prueba BingX — {moneda}</b>\n"
-                f"<b>Coin-M</b> — Contrato: <code>{contrato_coinm}</code>\nPrecio: {precio_coinm} | Balance: {balance_coinm}\n\n"
-                f"<b>USDT-M</b> — Precio: {precio_usdtm} | Balance: {balance_usdtm}")
+                f"<b>Coin-M</b> — Contrato: <code>{contrato_coinm}</code>\nPrecio: {precio_coinm} | Balance: {balance_coinm}\n"
+                f"Modo de margen: <code>{margen_coinm}</code>\n\n"
+                f"<b>USDT-M</b> — Precio: {precio_usdtm} | Balance: {balance_usdtm}\n"
+                f"Modo de margen: <code>{margen_usdtm}</code>")
     except Exception as e:
         return f"⚠️ Error al conectar con BingX: {e}"
 

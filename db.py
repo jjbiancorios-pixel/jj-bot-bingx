@@ -158,7 +158,8 @@ def init_db():
     # columnas propias. Cubre cualquier versión vieja que haya quedado
     # en el Volume persistente.
     for nombre, tipo in [("contrato_tipo", "TEXT"), ("atr_abs", "REAL"),
-                         ("hvn_precio", "REAL"), ("salida_parcial_hecha", "INTEGER")]:
+                         ("hvn_precio", "REAL"), ("salida_parcial_hecha", "INTEGER"),
+                         ("intentos_fallidos_entrada", "INTEGER")]:
         try:
             cur.execute(f"ALTER TABLE ciclos ADD COLUMN {nombre} {tipo}")
         except Exception:
@@ -214,10 +215,10 @@ def crear_ciclo(moneda, direccion, contrato_tipo, precio_entrada_1, atr_abs, cap
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
-        INSERT INTO ciclos (moneda, direccion, contrato_tipo, fecha, hora_inicio, precio_entrada_1, atr_abs, capital_ciclo, creado)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        INSERT INTO ciclos (moneda, direccion, contrato_tipo, fecha, hora_inicio, precio_entrada_1, atr_abs, capital_ciclo, intentos_fallidos_entrada, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
     """, (moneda, direccion, contrato_tipo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"),
-          precio_entrada_1, atr_abs, capital_ciclo, ahora.isoformat()))
+          precio_entrada_1, atr_abs, capital_ciclo, 0, ahora.isoformat()))
     conn.commit()
     ciclo_id = cur.lastrowid
     conn.close()
@@ -247,6 +248,26 @@ def actualizar_tp(ciclo_id: int, hvn_precio: float, tp_actual: float):
     conn = _conn()
     cur = conn.cursor()
     cur.execute("UPDATE ciclos SET hvn_precio = ?, tp_actual = ? WHERE id = ?", (hvn_precio, tp_actual, ciclo_id))
+    conn.commit()
+    conn.close()
+
+
+def incrementar_intentos_fallidos(ciclo_id: int) -> int:
+    """20/09 — para el límite de reintentos (evitar el bucle de golpear a BingX cada 30seg indefinidamente). Devuelve el contador ya incrementado."""
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE ciclos SET intentos_fallidos_entrada = COALESCE(intentos_fallidos_entrada, 0) + 1 WHERE id = ?", (ciclo_id,))
+    conn.commit()
+    cur.execute("SELECT intentos_fallidos_entrada FROM ciclos WHERE id = ?", (ciclo_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def resetear_intentos_fallidos(ciclo_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE ciclos SET intentos_fallidos_entrada = 0 WHERE id = ?", (ciclo_id,))
     conn.commit()
     conn.close()
 

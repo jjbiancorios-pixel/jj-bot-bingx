@@ -565,26 +565,41 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
 
     ok = resultado.get("code") == 0
     if not ok:
-        telegram_cmds.enviar(f"⚠️ Falló la entrada {n_entrada} de {moneda} ({direccion}, {contrato_tipo})\n<code>{str(resultado)[:300]}</code>")
+        intentos = db.incrementar_intentos_fallidos(ciclo_id)
+        telegram_cmds.enviar(f"⚠️ Falló la entrada {n_entrada} de {moneda} ({direccion}, {contrato_tipo}) — intento {intentos}\n<code>{str(resultado)[:300]}</code>")
         return False
 
-    order_id = str(resultado.get("data", {}).get("orderId", ""))
-    db.guardar_entrada(ciclo_id, n_entrada, precio, margen_usd, order_id)
-    db.actualizar_ciclo_entrada(ciclo_id, n_entrada)
+    db.resetear_intentos_fallidos(ciclo_id)
 
-    # Recalcular TP (VPVR) con cada entrada nueva
-    hvn = calcular_vpvr_hvn(df4h, precio, direccion)
-    if hvn is not None:
-        tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn)
-        db.actualizar_tp(ciclo_id, hvn, tp_nuevo)
-        tp_txt = f"{tp_nuevo:.2f}"
-    else:
-        tp_txt = "sin nodo de volumen claro todavía"
+    # 20/09: extracción robusta de order_id (Juanjo señaló que BingX
+    # puede devolver el orderId en la raíz del diccionario en algunos
+    # casos, no siempre anidado en "data") + toda la escritura a base
+    # protegida, para que un fallo de escritura local no deje la
+    # orden real "huérfana" sin registrar.
+    try:
+        order_id = str(resultado.get("orderId") or resultado.get("data", {}).get("orderId", ""))
+        db.guardar_entrada(ciclo_id, n_entrada, precio, margen_usd, order_id)
+        db.actualizar_ciclo_entrada(ciclo_id, n_entrada)
 
-    telegram_cmds.enviar(
-        f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.MAX_ENTRADAS}</b> ({direccion}, {contrato_tipo})\n"
-        f"Precio: {precio:.2f} | Margen: USD {margen_usd:.2f}\nTP (VPVR): {tp_txt}"
-    )
+        hvn = calcular_vpvr_hvn(df4h, precio, direccion)
+        if hvn is not None:
+            tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn)
+            db.actualizar_tp(ciclo_id, hvn, tp_nuevo)
+            tp_txt = f"{tp_nuevo:.2f}"
+        else:
+            tp_txt = "sin nodo de volumen claro todavía"
+
+        telegram_cmds.enviar(
+            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.MAX_ENTRADAS}</b> ({direccion}, {contrato_tipo})\n"
+            f"Precio: {precio:.2f} | Margen: USD {margen_usd:.2f}\nTP (VPVR): {tp_txt}"
+        )
+    except Exception as e:
+        telegram_cmds.enviar(
+            f"🚨 <b>{moneda} entrada {n_entrada} EJECUTADA en BingX pero falló al registrarla localmente</b>\n"
+            f"order_id: {resultado.get('orderId') or resultado.get('data', {}).get('orderId', '?')}\n"
+            f"Error: {e}\nVerificar manualmente la posición real en BingX."
+        )
+        print(f"🚨 Error guardando entrada {n_entrada} de {moneda} (orden SÍ ejecutada en BingX): {e}", flush=True)
     return True
 
 
@@ -757,7 +772,21 @@ def chequeo_riesgo():
                         continue
 
                 siguiente_n = ciclo["n_entradas_actuales"] + 1
-                if siguiente_n <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion, precio_1, ciclo["atr_abs"], precio_actual, siguiente_n):
+                intentos_previos = ciclo.get("intentos_fallidos_entrada") or 0
+                if intentos_previos >= 5:
+                    # 20/09: límite de reintentos — sin esto, el bot
+                    # golpeaba a BingX cada 30seg indefinidamente ante
+                    # un fallo persistente (encontrado en producción:
+                    # 4+ fallos seguidos en la entrada 2 de Coin-M sin
+                    # ningún tope). Se detiene y avisa 1 sola vez al
+                    # cruzar el umbral (no en cada ciclo después).
+                    if intentos_previos == 5:
+                        telegram_cmds.enviar(
+                            f"🚨 <b>{MONEDA} ({contrato_tipo})</b>: la entrada {siguiente_n} falló 5 veces seguidas — "
+                            f"dejo de reintentar automáticamente. Revisar manualmente en BingX y usar /cerrar_manual si corresponde."
+                        )
+                        db.incrementar_intentos_fallidos(ciclo["id"])  # pasa a 6, para no repetir el aviso
+                elif siguiente_n <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion, precio_1, ciclo["atr_abs"], precio_actual, siguiente_n):
                     df4h = get_velas_4h(MONEDA, 250)
                     if df4h is not None:
                         _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h)

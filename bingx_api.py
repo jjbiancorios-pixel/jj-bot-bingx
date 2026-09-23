@@ -136,6 +136,25 @@ def consultar_balance(moneda: str):
     return None
 
 
+def fijar_leverage(symbol: str, leverage: int, position_side: str) -> dict:
+    """
+    20/09 — Fija el leverage explícitamente para Coin-M, a pedido de
+    Juanjo (encontrado en producción: la cuenta real estaba en 100x,
+    el bot nunca lo fijaba, solo lo asumía en sus propios cálculos
+    internos — desfasaje serio entre el SL calculado y el SL real).
+    Endpoint INFERIDO por el mismo patrón que USDT-M (confirmado) —
+    verificar con /probar_bingx la primera vez.
+    """
+    params = {"symbol": symbol, "side": position_side, "leverage": leverage}
+    return _post("/openApi/cswap/v1/trade/leverage", params)
+
+
+def fijar_leverage_usdtm(symbol: str, leverage: int, position_side: str) -> dict:
+    """20/09 — Fija leverage para USDT-M. Endpoint CONFIRMADO (ejemplo real de código de terceros, ccxt)."""
+    params = {"symbol": symbol, "side": position_side, "leverage": leverage}
+    return _post("/openApi/swap/v2/trade/leverage", params)
+
+
 def fijar_margen_aislado(symbol: str) -> dict:
     """
     20/09 — Fija margen AISLADO para Coin-M, a pedido de Juanjo (el

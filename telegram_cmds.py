@@ -61,6 +61,31 @@ def _cmd_estado() -> str:
             f"Entradas promedio por ciclo: {r['entradas_promedio']}")
 
 
+def _cmd_cerrar_manual(args: list) -> str:
+    """
+    20/09 — equivalente al /cerrar_manual de Bot Cripto: corrige una
+    posición real que cerraste manualmente en la app de BingX, pero
+    que nuestra base sigue mostrando abierta.
+    Uso: /cerrar_manual CONTRATO_TIPO RESULTADO_PCT
+    Ej: /cerrar_manual coinm 2.24   (usa el % de la app, como PnL/margen*100)
+    """
+    if len(args) < 2:
+        return "Uso: /cerrar_manual CONTRATO_TIPO RESULTADO_PCT\nEj: /cerrar_manual coinm 2.24\n(CONTRATO_TIPO: coinm o usdtm)"
+    contrato_tipo = "COIN-M" if args[0].lower() in ("coinm", "coin-m") else "USDT-M"
+    try:
+        resultado_pct = float(args[1])
+    except ValueError:
+        return "⚠️ El resultado tiene que ser un número, ej: 2.24 o -3.5"
+
+    ciclo = db.ciclo_abierto("ETH", contrato_tipo)
+    if not ciclo:
+        return f"No hay ningún ciclo real abierto en {contrato_tipo} para corregir."
+
+    db.cerrar_ciclo(ciclo["id"], resultado_pct, "cerrado_manual")
+    return (f"✅ Corregido: ETH {ciclo['direccion']} ({contrato_tipo}) marcado como cerrado "
+            f"con resultado {resultado_pct:+.2f}% (motivo: cerrado_manual)")
+
+
 def _cmd_pendientes() -> str:
     ciclos = db.ciclos_abiertos()
     sim = db.simulacion_abierta()
@@ -319,6 +344,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_estado()
     elif cmd == "/pendientes":
         return _cmd_pendientes()
+    elif cmd == "/cerrar_manual":
+        return _cmd_cerrar_manual(args)
     elif cmd == "/simulaciones":
         return _cmd_simulaciones(args)
     elif cmd == "/pausar_todo":

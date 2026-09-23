@@ -500,20 +500,50 @@ def abrir_ciclo_real(candidato: dict):
             telegram_cmds.enviar(f"⚠️ No se pudo leer el balance ({contrato_tipo}) para {moneda} — no se abre ese ciclo.")
             continue
 
+        # 20/09 FIX: antes se creaba el registro en nuestra base ANTES
+        # de intentar la orden real — si la orden fallaba (como pasó
+        # con Coin-M por el bug de contratos), quedaba un ciclo
+        # "fantasma" marcado como abierto, sin ninguna entrada real
+        # detrás. Ahora el registro solo se crea si la entrada 1
+        # realmente se ejecutó en BingX.
         ciclo_id = db.crear_ciclo(moneda, direccion, contrato_tipo, candidato["precio_entrada"], candidato["atr_abs"], capital)
-        _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, 1, candidato["precio_entrada"], capital, candidato["df4h"])
+        ok = _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, 1, candidato["precio_entrada"], capital, candidato["df4h"])
+        if not ok:
+            db.cerrar_ciclo(ciclo_id, 0.0, "entrada_1_fallida")
 
 
 def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, precio, capital_ciclo, df4h):
-    margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
+    """
+    20/09 FIX CRÍTICO (encontrado con capital real): 2 bugs reales.
+    1. El leverage nunca se fijaba en la cuenta — solo se asumía en
+       los cálculos internos. La cuenta real estaba en 100x mientras
+       el código asumía 20x, desfasando todo el cálculo de SL/margen.
+    2. Para Coin-M, `capital_ciclo` es el balance en ETH (ej. 0.2),
+       no en dólares — se estaba usando directo como si fuera USD,
+       dando un margen ~13.000 veces más chico de lo real y una
+       cantidad que redondeaba a "0.0" (rechazada por BingX: Coin-M
+       además espera un número ENTERO de contratos, no ETH
+       fraccionario — 1 contrato ETH-USD = 10 USD de nocional).
+    """
     side = "BUY" if direccion == "LARGO" else "SELL"
     position_side = "LONG" if direccion == "LARGO" else "SHORT"
-    notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
-    quantity = round(notional_usd / precio, 4)
+
+    if contrato_tipo == "COIN-M":
+        capital_usd_equivalente = capital_ciclo * precio  # ETH -> USD al precio actual
+        margen_usd = capital_usd_equivalente * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
+        notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
+        quantity = max(1, round(notional_usd / gestion_riesgo.VALOR_CONTRATO_COINM_USD))  # entero, mínimo 1
+    else:
+        margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # USDT-M: capital ya está en USD
+        notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
+        quantity = round(notional_usd / precio, 4)  # USDT-M: cantidad fraccionaria de la cripto
 
     if contrato_tipo == "COIN-M":
         symbol = f"{moneda}-USD"
         if n_entrada == 1:
+            r_leverage = bingx_api.fijar_leverage(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
+            if r_leverage.get("code") != 0:
+                print(f"⚠️ No se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x (Coin-M) para {symbol}: {r_leverage}", flush=True)
             # 20/09: margen aislado, a pedido de Juanjo — solo tiene
             # sentido en la 1ra entrada (con posición ya abierta,
             # BingX rechaza el cambio de modo; no bloquea la entrada
@@ -525,6 +555,9 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
     else:
         symbol = f"{moneda}-USDT"
         if n_entrada == 1:
+            r_leverage = bingx_api.fijar_leverage_usdtm(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
+            if r_leverage.get("code") != 0:
+                print(f"⚠️ No se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x (USDT-M) para {symbol}: {r_leverage}", flush=True)
             r_margen = bingx_api.fijar_margen_aislado_usdtm(symbol)
             if r_margen.get("code") != 0:
                 print(f"⚠️ No se pudo confirmar margen aislado (USDT-M) para {symbol}: {r_margen}", flush=True)
@@ -637,8 +670,17 @@ def _capital_estimado_para_simulacion(moneda: str, direccion: str) -> float:
 
 def _ejecutar_entrada_simulada(tabla: str, sim_id: int, moneda: str, direccion: str, n_entrada: int,
                                 precio: float, capital_ciclo: float, df4h):
-    """17/09 — versión SIN capital real de _ejecutar_entrada, para las simulaciones de comparación."""
-    margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
+    """
+    17/09 — versión SIN capital real de _ejecutar_entrada, para las
+    simulaciones de comparación. 20/09 FIX: mismo problema de unidades
+    que la real — para LARGO, capital_ciclo viene del balance Coin-M
+    (en ETH), hay que convertirlo a USD antes de calcular el margen.
+    """
+    if direccion == "LARGO":
+        capital_usd_equivalente = capital_ciclo * precio
+        margen_usd = capital_usd_equivalente * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
+    else:
+        margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # CORTO: USDT-M, ya en USD
     db.sim_guardar_entrada(tabla, sim_id, n_entrada, precio, margen_usd)
     db.sim_actualizar_entrada(tabla, sim_id, n_entrada)
     hvn = calcular_vpvr_hvn(df4h, precio, direccion)

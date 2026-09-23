@@ -118,6 +118,26 @@ def consultar_precio(symbol: str):
         return None
 
 
+def consultar_posiciones(symbol: str = None) -> dict:
+    """
+    20/09 — Consulta posiciones REALES abiertas en Coin-M, para poder
+    comparar contra lo que nuestra base piensa que hay (encontrado en
+    producción: un desfasaje serio entre ambas — la base pensaba que
+    había 1 entrada de 21 contratos, la posición real tenía 315).
+    Endpoint INFERIDO por patrón (cswap/v1, no encontré confirmación
+    tan directa como para otros endpoints Coin-M) — tratar con cautela
+    hasta confirmar con un caso real.
+    """
+    params = {"symbol": symbol} if symbol else {}
+    return _get("/openApi/cswap/v1/user/positions", params)
+
+
+def consultar_posiciones_usdtm(symbol: str = None) -> dict:
+    """20/09 — Consulta posiciones REALES en USDT-M. Endpoint razonablemente confirmado (librerías de terceros lo documentan bajo swap/v2/user/positions)."""
+    params = {"symbol": symbol} if symbol else {}
+    return _get("/openApi/swap/v2/user/positions", params)
+
+
 def consultar_balance(moneda: str):
     """
     GET /cswap/v1/user/balance — balance de la cuenta Coin-M.

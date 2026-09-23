@@ -143,6 +143,26 @@ def _cmd_reanudar_todo() -> str:
     return "✅ Bot BingX reanudado."
 
 
+def _cmd_verificar_posicion(args: list) -> str:
+    """20/09 — compara la posición REAL en BingX contra lo que nuestra base piensa que hay (para detectar desfasajes como el de hoy)."""
+    moneda = (args[0].upper() if args else "ETH")
+    try:
+        import bingx_api
+        pos_coinm = bingx_api.consultar_posiciones(f"{moneda}-USD")
+        pos_usdtm = bingx_api.consultar_posiciones_usdtm(f"{moneda}-USDT")
+        ciclo_coinm = db.ciclo_abierto(moneda, "COIN-M")
+        ciclo_usdtm = db.ciclo_abierto(moneda, "USDT-M")
+
+        lineas = [f"🔍 <b>Verificación real vs. base — {moneda}</b>\n"]
+        lineas.append(f"<b>Coin-M</b> — BingX dice: <code>{str(pos_coinm)[:300]}</code>")
+        lineas.append(f"Nuestra base dice: {'entrada ' + str(ciclo_coinm['n_entradas_actuales']) + '/5' if ciclo_coinm else 'sin ciclo abierto'}\n")
+        lineas.append(f"<b>USDT-M</b> — BingX dice: <code>{str(pos_usdtm)[:300]}</code>")
+        lineas.append(f"Nuestra base dice: {'entrada ' + str(ciclo_usdtm['n_entradas_actuales']) + '/5' if ciclo_usdtm else 'sin ciclo abierto'}")
+        return "\n".join(lineas)
+    except Exception as e:
+        return f"⚠️ Error al verificar: {e}"
+
+
 def _cmd_fijar_margen(args: list) -> str:
     """20/09 — fija margen aislado AHORA, sin esperar a una entrada nueva (para confirmar que el endpoint de Coin-M funciona de verdad)."""
     moneda = (args[0].upper() if args else "ETH")
@@ -356,6 +376,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_probar_bingx(args)
     elif cmd == "/fijar_margen":
         return _cmd_fijar_margen(args)
+    elif cmd == "/verificar_posicion":
+        return _cmd_verificar_posicion(args)
     elif cmd == "/gates":
         return _cmd_gates(args)
     elif cmd == "/informe":

@@ -563,7 +563,7 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
                 print(f"⚠️ No se pudo confirmar margen aislado (USDT-M) para {symbol}: {r_margen}", flush=True)
         resultado = bingx_api.crear_orden_usdtm(symbol, side, position_side, "MARKET", quantity)
 
-    ok = resultado.get("code") == 0
+    ok = bingx_api.orden_fue_exitosa(resultado)
     if not ok:
         intentos = db.incrementar_intentos_fallidos(ciclo_id)
         telegram_cmds.enviar(f"⚠️ Falló la entrada {n_entrada} de {moneda} ({direccion}, {contrato_tipo}) — intento {intentos}\n<code>{str(resultado)[:300]}</code>")
@@ -725,7 +725,7 @@ def chequeo_riesgo():
                 if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO):
                     pnl_margen = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
-                    if r.get("code") == 0:
+                    if bingx_api.orden_fue_exitosa(r):
                         db.cerrar_ciclo(ciclo["id"], pnl_margen, "stop_loss_margen")
                         telegram_cmds.enviar(f"🔴 <b>{MONEDA} SL (V4.1, por margen)</b> ({contrato_tipo}) — ciclo cerrado. PNL: {pnl_margen:+.2f}% del margen")
                     else:
@@ -748,7 +748,7 @@ def chequeo_riesgo():
 
                 if ciclo["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"]):
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
-                    if r.get("code") == 0:
+                    if bingx_api.orden_fue_exitosa(r):
                         resultado_pct = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                         db.cerrar_ciclo(ciclo["id"], resultado_pct, "tp_vpvr")
                         telegram_cmds.enviar(f"🟢 <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado. Resultado: {resultado_pct:+.2f}%")
@@ -764,7 +764,7 @@ def chequeo_riesgo():
                         qty_50pct = round((notional_total / 2) / precio_actual, 4)
                         position_side = "LONG" if direccion == "LARGO" else "SHORT"
                         r = bingx_api.cerrar_parcial(symbol, position_side, qty_50pct) if contrato_tipo == "COIN-M" else bingx_api.cerrar_parcial_usdtm(symbol, position_side, qty_50pct)
-                        if r.get("code") == 0:
+                        if bingx_api.orden_fue_exitosa(r):
                             db.marcar_salida_parcial_hecha(ciclo["id"])
                             telegram_cmds.enviar(f"🟡 <b>{MONEDA}</b> ({contrato_tipo}): salida parcial (50%) en breakeven del promedio")
                         else:

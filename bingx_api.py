@@ -218,6 +218,37 @@ def crear_orden(symbol: str, side: str, position_side: str, tipo: str, quantity:
     return _post("/openApi/cswap/v1/trade/order", params)
 
 
+def orden_fue_exitosa(resultado: dict) -> bool:
+    """
+    27/09 FIX CRÍTICO (encontrado con capital real): el endpoint Coin-M
+    /cswap/v1/trade/order (usado por crear_orden y cerrar_parcial) NO
+    siempre envuelve la respuesta en {"code":0,"data":{...}} como el
+    resto de los endpoints — cuando la orden se ejecuta bien, BingX
+    puede devolver directamente el objeto de la orden en formato PLANO
+    (ej. {'orderId': '210433...', 'symbol': 'ETH-USD', 'side': 'BUY',
+    ...}), SIN campo "code". El chequeo anterior (`resultado.get("code")
+    == 0`) daba False en ese caso (None != 0) e interpretaba una orden
+    real y exitosa como un fallo.
+    Consecuencia real observada: 2 entradas Coin-M (23 y 22 contratos)
+    marcadas como "falló la entrada" y nunca registradas en la base
+    (ok=False -> no se llama a db.guardar_entrada), mientras en BingX
+    se acumulaban de verdad en una sola posición de 45 contratos sin
+    ningún SL/trailing del bot vigilándola (el ciclo había quedado
+    cerrado como "entrada_1_fallida").
+    Regla de éxito: si viene "code", manda ese código (0 = éxito, lo
+    demás = fallo real). Si NO viene "code", se considera éxito solo si
+    hay un orderId real (plano o anidado en "data") — así se acepta
+    tanto la forma envuelta como la plana, y solo se marca fallo cuando
+    de verdad no hay ninguna orden creada.
+    """
+    if not isinstance(resultado, dict) or not resultado:
+        return False
+    if "code" in resultado:
+        return resultado.get("code") == 0
+    order_id = resultado.get("orderId") or resultado.get("data", {}).get("orderId")
+    return bool(order_id)
+
+
 def consultar_ordenes_abiertas(symbol: str = None) -> dict:
     """GET /cswap/v1/trade/openOrders — endpoint confirmado."""
     params = {"symbol": symbol} if symbol else {}

@@ -21,18 +21,31 @@ VALOR_CONTRATO_COINM_USD = 10  # 20/09: 1 contrato de ETH-USD Coin-M = 10 USD de
 MAX_ENTRADAS = 5
 ENTRADA_ACTIVA_SALIDA_PARCIAL = 4  # 13/09: re-agregado a pedido de Juanjo (se había perdido en la reescritura V4)
 
-# Múltiplos de ATR desde el precio de la 1ra entrada (caso de estudio del documento)
+# 28/09 — Directiva: progresión geométrica estricta (antes escala más
+# lineal 1.5/3.5/7.5/14.0) para que la entrada 2 no dispare con el puro
+# ruido de los primeros minutos de la vela de 15m (caso real: disparó a
+# los 8 minutos de la entrada 1, por una caída de apenas 1.5x ATR).
+# Nota: la directiva solo dio valores de "largo" — los de "corto" se
+# escalaron manteniendo la misma proporción que ya tenía el diseño
+# anterior (~0.8x del valor de largo); confirmar si esa proporción
+# sigue siendo la deseada.
 NIVELES_ENTRADA_ATR = {
-    2: {"largo": 1.5, "corto": 1.2},
-    3: {"largo": 3.5, "corto": 2.8},
-    4: {"largo": 7.5, "corto": 6.0},   # V5.1 (20/09): antes 7.0/5.5 — estirado
-    5: {"largo": 14.0, "corto": 10.5},  # V5.1 (20/09): antes 12.0/8.5 — estirado
+    2: {"largo": 3.0, "corto": 2.4},
+    3: {"largo": 5.5, "corto": 4.4},
+    4: {"largo": 8.5, "corto": 6.8},
+    5: {"largo": 12.0, "corto": 9.6},
 }
 
 SL_RETROCESO_LARGO_PCT = -51.6  # V4 (antigua) — precio crudo desde entrada 1
 SL_RETROCESO_CORTO_PCT = 31.0   # V4 (antigua)
 
-SL_MARGEN_PCT = -40.0  # V4.1 — sobre el margen TOTAL invertido (todas las entradas), no precio crudo
+# 28/09 — Directiva: umbral preventivo LOCAL a -38.5% (antes -40.0%),
+# para ganarle de mano al -40% real de BingX si el funding rate o las
+# comisiones lo empujan a liquidar antes de lo esperado. El -40.0%
+# como tal ya no se usa en el cálculo, queda documentado el valor real
+# del exchange como referencia.
+SL_MARGEN_PCT_EXCHANGE_REAL = -40.0
+SL_MARGEN_PCT = -38.5  # V4.2 — colchón preventivo local, sobre el margen TOTAL invertido
 
 TP_OFFSET_VPVR_PCT = 0.5
 

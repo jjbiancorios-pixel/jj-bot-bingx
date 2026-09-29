@@ -21,6 +21,7 @@ estrategia ORIGINAL (canal/doble-triple techo-piso) — pedido explícito
 de Juanjo para seguir recolectando datos comparativos mientras se
 prueba este nuevo diseño.
 """
+import math
 import requests
 import pandas as pd
 import numpy as np
@@ -532,7 +533,11 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
         capital_usd_equivalente = capital_ciclo * precio  # ETH -> USD al precio actual
         margen_usd = capital_usd_equivalente * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
         notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
-        quantity = max(1, round(notional_usd / gestion_riesgo.VALOR_CONTRATO_COINM_USD))  # entero, mínimo 1
+        # 28/09 — Directiva: truncado estricto hacia abajo (math.floor),
+        # no redondeo (round). Un redondeo hacia arriba puede pedirle a
+        # BingX más contratos de los que el saldo real en ETH cubre —
+        # esto elimina ese caso de rechazo por fondos insuficientes.
+        quantity = max(1, math.floor(notional_usd / gestion_riesgo.VALOR_CONTRATO_COINM_USD))  # entero, mínimo 1
     else:
         margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # USDT-M: capital ya está en USD
         notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
@@ -541,9 +546,21 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
     if contrato_tipo == "COIN-M":
         symbol = f"{moneda}-USD"
         if n_entrada == 1:
+            # 28/09 — Directiva: el seteo de leverage a 20x pasa a ser
+            # OBLIGATORIO antes de mandar la Entrada 1. Antes, si BingX
+            # no lo confirmaba (code != 0), solo se imprimía un warning
+            # y se seguía igual — dejando abierta la puerta al bug
+            # histórico (cuenta real operando a 100x por defecto).
+            # Ahora, si no se puede confirmar, se aborta ACÁ, sin mandar
+            # ninguna orden real.
             r_leverage = bingx_api.fijar_leverage(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
             if r_leverage.get("code") != 0:
-                print(f"⚠️ No se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x (Coin-M) para {symbol}: {r_leverage}", flush=True)
+                telegram_cmds.enviar(
+                    f"🚨 <b>{moneda} ({contrato_tipo})</b>: no se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x "
+                    f"antes de la entrada 1 — ABORTADO por seguridad, no se mandó ninguna orden real.\n"
+                    f"<code>{str(r_leverage)[:300]}</code>"
+                )
+                return False
             # 20/09: margen aislado, a pedido de Juanjo — solo tiene
             # sentido en la 1ra entrada (con posición ya abierta,
             # BingX rechaza el cambio de modo; no bloquea la entrada
@@ -555,9 +572,15 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
     else:
         symbol = f"{moneda}-USDT"
         if n_entrada == 1:
+            # 28/09 — Directiva: mismo criterio obligatorio que en Coin-M.
             r_leverage = bingx_api.fijar_leverage_usdtm(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
             if r_leverage.get("code") != 0:
-                print(f"⚠️ No se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x (USDT-M) para {symbol}: {r_leverage}", flush=True)
+                telegram_cmds.enviar(
+                    f"🚨 <b>{moneda} ({contrato_tipo})</b>: no se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x "
+                    f"antes de la entrada 1 — ABORTADO por seguridad, no se mandó ninguna orden real.\n"
+                    f"<code>{str(r_leverage)[:300]}</code>"
+                )
+                return False
             r_margen = bingx_api.fijar_margen_aislado_usdtm(symbol)
             if r_margen.get("code") != 0:
                 print(f"⚠️ No se pudo confirmar margen aislado (USDT-M) para {symbol}: {r_margen}", flush=True)

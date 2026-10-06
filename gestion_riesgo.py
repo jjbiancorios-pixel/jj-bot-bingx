@@ -36,6 +36,26 @@ NIVELES_ENTRADA_ATR = {
     5: {"largo": 12.0, "corto": 9.6},
 }
 
+# ── Modo Oscilación (05/10) — sub-módulo alternativo, switch de FASE ──
+# No es un gate nuevo sobre V5.0: es un "desviador de tráfico". El
+# switch (ciclo_seleccion, main.py) calcula ADX(1h) ANTES de elegir
+# estrategia — si es alto, sigue el camino tendencial de siempre
+# (V5.0, sin tocar); si es bajo, desvía el flujo exclusivamente a este
+# módulo. El ADX nunca bloquea operar, solo decide qué lógica maneja
+# el trade (directiva explícita de Juanjo, 05/10).
+ADX_UMBRAL_OSCILACION = 22      # ADX(1h) < esto -> Fase de Materialización (switch a Oscilación)
+RSI_OSCILACION_LARGO_MAX = 32   # RSI(4h) <= esto dispara entrada LARGO en Modo Oscilación
+RSI_OSCILACION_CORTO_MIN = 68   # RSI(4h) >= esto dispara entrada CORTO en Modo Oscilación
+
+# Separación de DCA del Modo Oscilación: variable LOCAL y ENCAPSULADA,
+# de uso EXCLUSIVO dentro de este modo — NO modifica ni reemplaza
+# NIVELES_ENTRADA_ATR (que sigue intacta para la estrategia tendencial
+# cuando ADX(1h) >= ADX_UMBRAL_OSCILACION). Directiva 05/10: cada
+# re-entrada requiere que el precio se mueva en contra 1.5×ATR(1h)
+# desde la ÚLTIMA entrada ejecutada (no desde la entrada 1, a
+# diferencia de la tabla tendencial).
+DCA_OSCILACION_ATR_MULT = 1.5
+
 SL_RETROCESO_LARGO_PCT = -51.6  # V4 (antigua) — precio crudo desde entrada 1
 SL_RETROCESO_CORTO_PCT = 31.0   # V4 (antigua)
 
@@ -102,6 +122,23 @@ def precio_dispara_siguiente_entrada(direccion: str, precio_entrada_1: float, at
         return precio_actual <= umbral
     else:
         umbral = precio_entrada_1 + mult * atr_abs
+        return precio_actual >= umbral
+
+
+def precio_dispara_siguiente_entrada_oscilacion(direccion: str, precio_ultima_entrada: float, atr_1h: float, precio_actual: float) -> bool:
+    """
+    05/10 — DCA exclusivo del Modo Oscilación: separación fija de
+    DCA_OSCILACION_ATR_MULT × ATR(1h), medida desde la ÚLTIMA entrada
+    ejecutada (no desde la entrada 1 como la tabla tendencial
+    NIVELES_ENTRADA_ATR, que esta función no usa ni toca).
+    """
+    if atr_1h is None or atr_1h <= 0:
+        return False
+    if direccion == "LARGO":
+        umbral = precio_ultima_entrada - DCA_OSCILACION_ATR_MULT * atr_1h
+        return precio_actual <= umbral
+    else:
+        umbral = precio_ultima_entrada + DCA_OSCILACION_ATR_MULT * atr_1h
         return precio_actual >= umbral
 
 

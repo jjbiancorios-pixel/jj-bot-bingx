@@ -159,7 +159,8 @@ def init_db():
     # en el Volume persistente.
     for nombre, tipo in [("contrato_tipo", "TEXT"), ("atr_abs", "REAL"),
                          ("hvn_precio", "REAL"), ("salida_parcial_hecha", "INTEGER"),
-                         ("intentos_fallidos_entrada", "INTEGER")]:
+                         ("intentos_fallidos_entrada", "INTEGER"),
+                         ("modo", "TEXT")]:  # 05/10: "tendencial" (default) o "oscilacion" — switch de fase por ADX(1h)
         try:
             cur.execute(f"ALTER TABLE ciclos ADD COLUMN {nombre} {tipo}")
         except Exception:
@@ -210,15 +211,15 @@ def guardar_gates_log(moneda, direccion_candidata, paso_ema200, paso_atr_vela, p
 
 
 # ── Ciclos reales ─────────────────────────────────────────────
-def crear_ciclo(moneda, direccion, contrato_tipo, precio_entrada_1, atr_abs, capital_ciclo) -> int:
+def crear_ciclo(moneda, direccion, contrato_tipo, precio_entrada_1, atr_abs, capital_ciclo, modo="tendencial") -> int:
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
-        INSERT INTO ciclos (moneda, direccion, contrato_tipo, fecha, hora_inicio, precio_entrada_1, atr_abs, capital_ciclo, intentos_fallidos_entrada, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO ciclos (moneda, direccion, contrato_tipo, fecha, hora_inicio, precio_entrada_1, atr_abs, capital_ciclo, intentos_fallidos_entrada, modo, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (moneda, direccion, contrato_tipo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"),
-          precio_entrada_1, atr_abs, capital_ciclo, 0, ahora.isoformat()))
+          precio_entrada_1, atr_abs, capital_ciclo, 0, modo, ahora.isoformat()))
     conn.commit()
     ciclo_id = cur.lastrowid
     conn.close()
@@ -337,15 +338,33 @@ def cerrar_ciclo(ciclo_id: int, resultado_pct: float, motivo: str):
     conn.close()
 
 
-def resumen_ciclos(desde_fecha: str = None) -> dict:
+def resumen_ciclos(desde_fecha: str = None, modo: str = None) -> dict:
+    """
+    05/10: agrega filtro opcional por `modo` ("tendencial" u
+    "oscilacion") — sin esto, el resultado real mezclaba las entradas
+    de V5.0 con las del Modo Oscilación nuevo en un solo número,
+    tapando si cada módulo rinde distinto (justo lo que hace falta
+    medir antes de confiar en el nuevo modo).
+    """
     conn = _conn()
     cur = conn.cursor()
     query = "SELECT * FROM ciclos WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
-    params = ()
+    params = []
     if desde_fecha:
         query += " AND fecha_cierre >= ?"
-        params = (desde_fecha,)
-    cur.execute(query, params)
+        params.append(desde_fecha)
+    if modo:
+        if modo == "tendencial":
+            # 'modo' quedó NULL en los ciclos creados antes del 05/10
+            # (previos a que la columna existiera) — todos esos eran
+            # tendencial, así que se cuentan junto con los nuevos que
+            # sí lo guardan explícito.
+            query += " AND (modo = ? OR modo IS NULL)"
+            params.append(modo)
+        else:
+            query += " AND modo = ?"
+            params.append(modo)
+    cur.execute(query, tuple(params))
     cerrados = [dict(r) for r in cur.fetchall()]
     conn.close()
     if not cerrados:

@@ -148,6 +148,26 @@ def calc_bollinger(s, p=20, num_std=2):
     return banda_sup, banda_inf
 
 
+def calc_adx(df, p=14):
+    """
+    05/10 — ADX, método de Wilder. Reutilizado del Cripto Bot (ya
+    validado ahí). Usado ÚNICAMENTE como switch de fase del Modo
+    Oscilación (ver ciclo_seleccion) — no es un gate de V5.0.
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_w = tr.ewm(alpha=1 / p, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / p, adjust=False).mean()
+    return {"adx": float(adx.iloc[-1])}
+
+
 def calcular_vpvr_hvn(df, precio_actual, direccion, n_bins=24):
     """
     VPVR simplificado: histograma de volumen por nivel de precio sobre
@@ -384,6 +404,43 @@ def evaluar_entrada_v5(moneda: str):
     }
 
 
+# ── Modo Oscilación (05/10) — sub-módulo alternativo, NO reemplaza V5.0 ──
+def evaluar_modo_oscilacion(moneda: str):
+    """
+    Directiva 05/10 ("Modo Oscilación (RSI 4H)"): activado EXCLUSIVAMENTE
+    por el switch de fase en ciclo_seleccion() cuando ADX(1h) <
+    gestion_riesgo.ADX_UMBRAL_OSCILACION (mercado en materialización /
+    rango lateral). No es un gate adicional sobre evaluar_entrada_v5 —
+    es un camino de ejecución totalmente separado, con su propio
+    trigger de entrada (RSI 4H en zona extrema) y su propia regla de
+    DCA (gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion,
+    separada de NIVELES_ENTRADA_ATR). V5.0 sigue intacto para cuando
+    el ADX vuelva a confirmar tendencia.
+    """
+    df4h = get_velas_4h(moneda, 250)
+    df1h = get_velas_1h(moneda, 100)
+    if df4h is None or df1h is None:
+        return None
+
+    precio = df1h["close"].iloc[-1]
+    rsi_4h = calc_rsi(df4h["close"], 14).iloc[-1]
+    atr_1h = calc_atr(df1h, 14).iloc[-1]
+
+    if atr_1h is None or not atr_1h > 0:
+        return None
+
+    if rsi_4h <= gestion_riesgo.RSI_OSCILACION_LARGO_MAX:
+        direccion_candidata = "LARGO"
+    elif rsi_4h >= gestion_riesgo.RSI_OSCILACION_CORTO_MIN:
+        direccion_candidata = "CORTO"
+    else:
+        return None
+
+    return {
+        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
+        "atr_abs": round(atr_1h, 6), "df4h": df4h,  # atr_abs acá es ATR(1h), de uso exclusivo del DCA de este modo
+    }
+
 
 # ── Detectores VIEJOS (solo para la simulación, sin capital real) ──
 def detectar_canal(df, lookback=40, tolerancia_pct=0.5):
@@ -479,13 +536,18 @@ def analizar_simulacion_original(moneda: str):
 
 
 # ── Apertura de ciclo real — rutea Coin-M o USDT-M según dirección ──
-def abrir_ciclo_real(candidato: dict):
+def abrir_ciclo_real(candidato: dict, modo: str = "tendencial"):
     """
     13/09: en LARGO se abren 2 ciclos INDEPENDIENTES y simultáneos —
     uno con colateral ETH (Coin-M) y otro con colateral USDT (USDT-M),
     cada uno con su propio capital y sus propias entradas (confirmado
     por Juanjo — no es un reparto dentro del mismo ciclo, son
     posiciones separadas). En CORTO, solo USDT-M (regla del documento).
+
+    05/10: `modo` ("tendencial" u "oscilacion") queda guardado en el
+    ciclo para que chequeo_riesgo() sepa qué regla de DCA aplicar en
+    las re-entradas (NIVELES_ENTRADA_ATR vs. la tabla separada del
+    Modo Oscilación).
     """
     moneda = candidato["moneda"]
     direccion = candidato["direccion"]
@@ -507,13 +569,13 @@ def abrir_ciclo_real(candidato: dict):
         # "fantasma" marcado como abierto, sin ninguna entrada real
         # detrás. Ahora el registro solo se crea si la entrada 1
         # realmente se ejecutó en BingX.
-        ciclo_id = db.crear_ciclo(moneda, direccion, contrato_tipo, candidato["precio_entrada"], candidato["atr_abs"], capital)
-        ok = _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, 1, candidato["precio_entrada"], capital, candidato["df4h"])
+        ciclo_id = db.crear_ciclo(moneda, direccion, contrato_tipo, candidato["precio_entrada"], candidato["atr_abs"], capital, modo=modo)
+        ok = _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, 1, candidato["precio_entrada"], capital, candidato["df4h"], modo=modo)
         if not ok:
             db.cerrar_ciclo(ciclo_id, 0.0, "entrada_1_fallida")
 
 
-def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, precio, capital_ciclo, df4h):
+def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, precio, capital_ciclo, df4h, modo="tendencial"):
     """
     20/09 FIX CRÍTICO (encontrado con capital real): 2 bugs reales.
     1. El leverage nunca se fijaba en la cuenta — solo se asumía en
@@ -612,8 +674,9 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
         else:
             tp_txt = "sin nodo de volumen claro todavía"
 
+        tag_modo = " [Modo Oscilación]" if modo == "oscilacion" else ""
         telegram_cmds.enviar(
-            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.MAX_ENTRADAS}</b> ({direccion}, {contrato_tipo})\n"
+            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.MAX_ENTRADAS}</b> ({direccion}, {contrato_tipo}){tag_modo}\n"
             f"Precio: {precio:.2f} | Margen: USD {margen_usd:.2f}\nTP (VPVR): {tp_txt}"
         )
     except Exception as e:
@@ -635,15 +698,42 @@ def abrir_simulacion(candidato: dict):
 def ciclo_seleccion():
     pausado = db.esta_pausado_global()
 
-    # ── V5.0 (PRINCIPAL, 17/09) — real si no está pausado ──
+    # ── Switch de FASE (05/10) — ADX(1h) decide qué módulo maneja el
+    # trade REAL. No es un gate: no bloquea operar, solo desvía el
+    # flujo. Alto -> sigue V5.0 (tendencial, intacto). Bajo -> se
+    # desvía EXCLUSIVAMENTE al Modo Oscilación. Ante cualquier error o
+    # falta de datos, fail-safe a "tendencial" (el comportamiento de
+    # siempre, sin inventar una fase nueva a ciegas). ──
+    fase = "tendencial"
+    try:
+        df1h_switch = get_velas_1h(MONEDA, 100)
+        if df1h_switch is not None:
+            adx_1h_switch = calc_adx(df1h_switch)["adx"]
+            if adx_1h_switch < gestion_riesgo.ADX_UMBRAL_OSCILACION:
+                fase = "oscilacion"
+                print(f"MERCADO EN MATERIALIZACIÓN (ADX: {adx_1h_switch:.1f}) -> Cambiando a Modo Oscilación (RSI 4H).", flush=True)
+    except Exception as e:
+        print(f"Error calculando ADX(1h) para el switch de fase (sigue tendencial): {e}", flush=True)
+
+    # ── V5.0 (PRINCIPAL, 17/09) — real solo si fase == tendencial ──
     try:
         candidato_v5 = evaluar_entrada_v5(MONEDA)
     except Exception as e:
         print(f"Error analizando {MONEDA} (V5.0): {e}")
         candidato_v5 = None
 
-    if candidato_v5 and not pausado:
-        abrir_ciclo_real(candidato_v5)
+    if candidato_v5 and not pausado and fase == "tendencial":
+        abrir_ciclo_real(candidato_v5, modo="tendencial")
+
+    # ── Modo Oscilación (05/10) — real solo si fase == oscilacion ──
+    try:
+        candidato_oscilacion = evaluar_modo_oscilacion(MONEDA) if fase == "oscilacion" else None
+    except Exception as e:
+        print(f"Error analizando {MONEDA} (Modo Oscilación): {e}")
+        candidato_oscilacion = None
+
+    if candidato_oscilacion and not pausado:
+        abrir_ciclo_real(candidato_oscilacion, modo="oscilacion")
 
     # ── "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa ──
     if candidato_v5 and not db.sim_ciclo_abierto("simulaciones_v5_fiel", MONEDA):
@@ -809,10 +899,29 @@ def chequeo_riesgo():
                             f"dejo de reintentar automáticamente. Revisar manualmente en BingX y usar /cerrar_manual si corresponde."
                         )
                         db.incrementar_intentos_fallidos(ciclo["id"])  # pasa a 6, para no repetir el aviso
-                elif siguiente_n <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion, precio_1, ciclo["atr_abs"], precio_actual, siguiente_n):
-                    df4h = get_velas_4h(MONEDA, 250)
-                    if df4h is not None:
-                        _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h)
+                else:
+                    # 05/10: DCA separado por modo del ciclo. "oscilacion"
+                    # usa gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion
+                    # (1.5×ATR(1h) desde la ÚLTIMA entrada) — la tabla
+                    # NIVELES_ENTRADA_ATR de "tendencial" no se toca.
+                    modo_ciclo = ciclo.get("modo") or "tendencial"
+                    if modo_ciclo == "oscilacion":
+                        entradas_previas = db.obtener_entradas(ciclo["id"])
+                        precio_ultima_entrada = entradas_previas[-1]["precio"] if entradas_previas else precio_1
+                        dispara_siguiente = (
+                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS
+                            and gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion(direccion, precio_ultima_entrada, ciclo["atr_abs"], precio_actual)
+                        )
+                    else:
+                        dispara_siguiente = (
+                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS
+                            and gestion_riesgo.precio_dispara_siguiente_entrada(direccion, precio_1, ciclo["atr_abs"], precio_actual, siguiente_n)
+                        )
+
+                    if dispara_siguiente:
+                        df4h = get_velas_4h(MONEDA, 250)
+                        if df4h is not None:
+                            _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h, modo=modo_ciclo)
 
             # ── 17/09: chequeo de las 2 simulaciones de comparación (V4 antigua y V4.1 fiel) ──
             for tabla_sim, usa_sl_margen in (("simulaciones_v4_antigua", False), ("simulaciones_v41_fiel", True), ("simulaciones_v5_fiel", True)):

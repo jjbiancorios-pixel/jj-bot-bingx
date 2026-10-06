@@ -6,6 +6,7 @@ import requests
 import os
 from datetime import datetime
 import db
+import gestion_riesgo
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -241,14 +242,16 @@ def _cmd_comparar(args: list) -> str:
         n = r.get("n_cerrados", r.get("n_cerradas"))
         return f"n={n} | win rate {r['win_rate_pct']}% | neto {r['resultado_neto_pct']:+.2f}%"
 
-    r_real = db.resumen_ciclos(desde_fecha)
+    r_real_tendencial = db.resumen_ciclos(desde_fecha, modo="tendencial")
+    r_real_oscilacion = db.resumen_ciclos(desde_fecha, modo="oscilacion")
     r_v5_fiel = db.sim_resumen("simulaciones_v5_fiel", desde_fecha)
     r_v41_fiel = db.sim_resumen("simulaciones_v41_fiel", desde_fecha)
     r_v4_antigua = db.sim_resumen("simulaciones_v4_antigua", desde_fecha)
     r_original = db.resumen_simulaciones(desde_fecha)
 
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
-            f"🔴 Real (V5.0, con capital): {_fmt(r_real)}\n\n"
+            f"🔴 Real tendencial (V5.0, ADX≥{gestion_riesgo.ADX_UMBRAL_OSCILACION}): {_fmt(r_real_tendencial)}\n\n"
+            f"🌊 Real Modo Oscilación (ADX<{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI 4H): {_fmt(r_real_oscilacion)}\n\n"
             f"👻 V5.0 fiel — con BTC-Anchor (sin pausa): {_fmt(r_v5_fiel)}\n\n"
             f"📜 V4.1 fiel — sin BTC-Anchor (comparación): {_fmt(r_v41_fiel)}\n\n"
             f"📐 V4 antigua (comparación): {_fmt(r_v4_antigua)}\n\n"
@@ -335,7 +338,8 @@ def _cmd_ultimas(args: list) -> str:
             continue
         lineas_detalle = []
         for f in filas:
-            lineas_detalle.append(f"  {f['fecha_cierre']} {f['hora_cierre']} | {f['direccion']} | {f['motivo_cierre']} | {f['resultado_pct']:+.2f}%")
+            tag_modo = f" | {f.get('modo') or 'tendencial'}" if es_real else ""
+            lineas_detalle.append(f"  {f['fecha_cierre']} {f['hora_cierre']} | {f['direccion']} | {f['motivo_cierre']} | {f['resultado_pct']:+.2f}%{tag_modo}")
         bloques.append(f"{etiqueta}:\n" + "\n".join(lineas_detalle))
 
     return f"📋 <b>Últimas {n} operaciones cerradas, por estrategia</b>\n\n" + "\n\n".join(bloques)

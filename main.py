@@ -668,7 +668,8 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
 
         hvn = calcular_vpvr_hvn(df4h, precio, direccion)
         if hvn is not None:
-            tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn)
+            _ref_tp = gestion_riesgo.calcular_promedio_ponderado(db.obtener_entradas(ciclo_id)) or precio
+            tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn, _ref_tp)
             db.actualizar_tp(ciclo_id, hvn, tp_nuevo)
             tp_txt = f"{tp_nuevo:.2f}"
         else:
@@ -813,7 +814,7 @@ def _ejecutar_entrada_simulada(tabla: str, sim_id: int, moneda: str, direccion: 
     db.sim_actualizar_entrada(tabla, sim_id, n_entrada)
     hvn = calcular_vpvr_hvn(df4h, precio, direccion)
     if hvn is not None:
-        tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn)
+        tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn, precio)
         db.sim_actualizar_tp(tabla, sim_id, hvn, tp_nuevo)
 
 
@@ -855,7 +856,8 @@ def chequeo_riesgo():
                     if df4h_tp_real is not None:
                         hvn_retry_real = calcular_vpvr_hvn(df4h_tp_real, precio_actual, direccion)
                         if hvn_retry_real is not None:
-                            tp_retry_real = gestion_riesgo.calcular_tp_vpvr(direccion, hvn_retry_real)
+                            _ref_retry = gestion_riesgo.calcular_promedio_ponderado(db.obtener_entradas(ciclo["id"])) or precio_actual
+                            tp_retry_real = gestion_riesgo.calcular_tp_vpvr(direccion, hvn_retry_real, _ref_retry)
                             db.actualizar_tp(ciclo["id"], hvn_retry_real, tp_retry_real)
                             ciclo["tp_actual"] = tp_retry_real
 
@@ -864,7 +866,11 @@ def chequeo_riesgo():
                     if bingx_api.orden_fue_exitosa(r):
                         resultado_pct = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                         db.cerrar_ciclo(ciclo["id"], resultado_pct, "tp_vpvr")
-                        telegram_cmds.enviar(f"🟢 <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado. Resultado: {resultado_pct:+.2f}%")
+                        neto_est = gestion_riesgo.pnl_neto_estimado_pct(resultado_pct, gestion_riesgo.LEVERAGE_FIJO)
+                        telegram_cmds.enviar(
+                            f"{'🟢' if neto_est > 0 else '🟠'} <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado.\n"
+                            f"Bruto: {resultado_pct:+.2f}% del margen | Neto est. (con comisiones): {neto_est:+.2f}%"
+                        )
                     else:
                         print(f"⚠️ BingX rechazó el TP de {MONEDA} ({contrato_tipo}): {r}", flush=True)
                     continue
@@ -956,7 +962,7 @@ def chequeo_riesgo():
                         if df4h_tp is not None:
                             hvn_retry = calcular_vpvr_hvn(df4h_tp, precio_sim, direccion_sim)
                             if hvn_retry is not None:
-                                tp_retry = gestion_riesgo.calcular_tp_vpvr(direccion_sim, hvn_retry)
+                                tp_retry = gestion_riesgo.calcular_tp_vpvr(direccion_sim, hvn_retry, precio_sim)
                                 db.sim_actualizar_tp(tabla_sim, sim["id"], hvn_retry, tp_retry)
                                 sim["tp_actual"] = tp_retry
 

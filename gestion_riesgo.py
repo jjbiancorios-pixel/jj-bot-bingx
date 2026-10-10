@@ -151,11 +151,42 @@ def precio_toca_sl(direccion: str, precio_entrada_1: float, precio_actual: float
         return precio_actual >= umbral
 
 
-def calcular_tp_vpvr(direccion: str, hvn_precio: float) -> float:
+# 10/10 fix20 — TP mínimo por encima de las comisiones.
+# Bug real (10/10, Modo Oscilación): en CORTO el nodo VPVR quedó a menos de
+# 0,5% del precio, así que nodo*1,005 cayó POR ENCIMA de la entrada y el TP
+# se "cumplía" en el primer chequeo (cierre en 4-19 s, ganancia imposible,
+# solo comisiones). Comisión real medida en BingX: 0,05% por lado sobre el
+# nocional (0,10% ida y vuelta = 2% del margen a 20x).
+FEE_TAKER_PCT_POR_LADO = 0.05
+# Distancia mínima del TP respecto al precio de referencia (entrada o
+# promedio ponderado): 0,25% de precio = 5% del margen a 20x, o sea ~2,5x
+# el costo de comisiones ida y vuelta (0,10%). Ajustable.
+TP_MIN_DISTANCIA_PCT = 0.25
+
+
+def calcular_tp_vpvr(direccion: str, hvn_precio: float, precio_ref: float = None) -> float:
+    """
+    TP = nodo VPVR con 0,5% de margen por dentro. Si se pasa `precio_ref`
+    (precio de entrada o promedio de las entradas), el TP se empuja, si hace
+    falta, hasta TP_MIN_DISTANCIA_PCT del lado correcto de esa referencia:
+    por debajo en CORTO, por encima en LARGO. Así un TP nunca queda del lado
+    equivocado ni más cerca que el costo de comisiones.
+    """
     if direccion == "LARGO":
-        return hvn_precio * (1 - TP_OFFSET_VPVR_PCT / 100)
+        tp = hvn_precio * (1 - TP_OFFSET_VPVR_PCT / 100)
+        if precio_ref:
+            tp = max(tp, precio_ref * (1 + TP_MIN_DISTANCIA_PCT / 100))
     else:
-        return hvn_precio * (1 + TP_OFFSET_VPVR_PCT / 100)
+        tp = hvn_precio * (1 + TP_OFFSET_VPVR_PCT / 100)
+        if precio_ref:
+            tp = min(tp, precio_ref * (1 - TP_MIN_DISTANCIA_PCT / 100))
+    return tp
+
+
+def pnl_neto_estimado_pct(pnl_bruto_pct: float, leverage: int = None) -> float:
+    """Resultado % sobre margen descontando comisiones taker estimadas (entrada + salida)."""
+    lev = leverage if leverage else LEVERAGE_FIJO
+    return pnl_bruto_pct - 2 * FEE_TAKER_PCT_POR_LADO * lev
 
 
 def precio_toca_tp(direccion: str, precio_actual: float, tp: float) -> bool:

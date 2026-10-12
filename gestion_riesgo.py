@@ -65,7 +65,21 @@ SL_RETROCESO_CORTO_PCT = 31.0   # V4 (antigua)
 # como tal ya no se usa en el cálculo, queda documentado el valor real
 # del exchange como referencia.
 SL_MARGEN_PCT_EXCHANGE_REAL = -40.0
-SL_MARGEN_PCT = -38.5  # V4.2 — colchón preventivo local, sobre el margen TOTAL invertido
+SL_MARGEN_PCT = -38.5  # V4.2 — YA NO SE USA desde fix21 (queda como referencia histórica)
+
+# 12/10 fix21 — Directiva de Juanjo: NO hay SL mientras el sistema sigue
+# generando entradas (1 a 4). El SL rige recién desde que se ejecutó la 5ta
+# entrada, y queda a 3% de PRECIO del precio promedio de entrada (a 20x:
+# 3% de precio = 60% del margen total). Se mide contra el PROMEDIO ponderado
+# de las entradas ejecutadas (calcular_pnl_pct_margen).
+# Con margen aislado, mientras no hay SL la pérdida máxima es el margen
+# invertido en el ciclo (liquidación). Una posición de 1 entrada (10/10)
+# mostraba precio de liquidación a ~4,5% de precio (≈ -90% del margen).
+# Si la 5ta entrada no se puede ejecutar (5 fallos seguidos), el bot avisa
+# por Telegram y deja de reintentar: en ese caso la posición queda SIN SL y
+# hay que revisarla a mano.
+SL_DISTANCIA_PRECIO_5TA_ENTRADA_PCT = 3.0
+SL_MARGEN_PCT_5TA_ENTRADA = -(SL_DISTANCIA_PRECIO_5TA_ENTRADA_PCT * LEVERAGE_FIJO)  # -60.0 a 20x
 
 TP_OFFSET_VPVR_PCT = 0.5
 
@@ -93,9 +107,16 @@ def calcular_pnl_pct_margen(entradas: list, precio_actual: float, direccion: str
 
 
 def precio_toca_sl_margen(entradas: list, precio_actual: float, direccion: str, leverage: int) -> bool:
-    """V4.1 — cierre inmediato si el PNL apalancado cae a -40% (o peor) del margen total invertido."""
+    """
+    fix21 — SL solo desde la 5ta entrada ejecutada: con 1 a 4 entradas nunca
+    cierra por SL. Con 5 entradas, cierra si el PNL apalancado cae a
+    SL_MARGEN_PCT_5TA_ENTRADA (-60% del margen total = 3% de precio desde el
+    promedio a 20x).
+    """
+    if len(entradas) < MAX_ENTRADAS:
+        return False
     pnl_pct = calcular_pnl_pct_margen(entradas, precio_actual, direccion, leverage)
-    return pnl_pct <= SL_MARGEN_PCT
+    return pnl_pct <= SL_MARGEN_PCT_5TA_ENTRADA
 
 
 def calcular_promedio_ponderado(entradas: list):

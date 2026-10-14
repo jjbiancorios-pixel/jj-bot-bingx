@@ -357,6 +357,86 @@ def _cmd_informe(args: list) -> str:
             f"Entradas promedio: {r['entradas_promedio']}")
 
 
+def _cmd_backup_db(args=None) -> str:
+    """
+    14/10 — /backup_db         : base completa comprimida (gzip).
+            /backup_db liviano : sin gates_log (mucho mas chica), comprimida.
+    Telegram limita a 50 MB por archivo de bot; se comprime y se usa una copia
+    consistente (API backup de SQLite) en vez de leer el archivo en uso.
+    """
+    import sqlite3, gzip, tempfile, shutil
+    if not os.path.exists(db.DB_PATH):
+        return "⚠️ No encontré la base de datos en el servidor."
+    liviano = bool(args) and args[0].lower() in ("liviano", "light", "lite")
+    fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d_%H%M")
+    tmpdir = tempfile.mkdtemp(prefix="bk_")
+    try:
+        copia = os.path.join(tmpdir, "copia.db")
+        src = sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True, timeout=30)
+        dst = sqlite3.connect(copia)
+        src.backup(dst)
+        src.close()
+        if liviano:
+            dst.execute("DROP TABLE IF EXISTS gates_log")
+            dst.commit()
+            dst.execute("VACUUM")
+        dst.close()
+        with open(copia, "rb") as f:
+            crudo = f.read()
+        comprimido = gzip.compress(crudo, compresslevel=6)
+        tag = "liviano_" if liviano else ""
+        nombre_archivo = f"bot_bingx_backup_{tag}{fecha}.db.gz"
+        if len(comprimido) > 49 * 1024 * 1024:
+            return (f"⚠️ Incluso comprimido pesa {len(comprimido)/1048576:.1f} MB "
+                    f"(límite Telegram 50 MB). Probá <code>/backup_db liviano</code>.")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        files = {"document": (nombre_archivo, comprimido, "application/gzip")}
+        data = {"chat_id": CHAT_ID,
+                "caption": (f"💾 Backup BingX {'LIVIANO (sin gates_log)' if liviano else 'completo'} — "
+                            f"{len(comprimido)/1048576:.2f} MB comprimido "
+                            f"({len(crudo)/1048576:.2f} MB original). Descomprimir con gunzip.")}
+        r = requests.post(url, data=data, files=files, timeout=180)
+        if not r.json().get("ok"):
+            return f"⚠️ Falló el envío: {r.json()}"
+        return None
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cmd_pico(args: list) -> str:
+    """
+    14/10 — Ultimos ciclos cerrados con su pico/peor (resultado BRUTO % del margen,
+    segun el precio que usa el bot) y en que minuto ocurrieron. /pico [N] (default 10).
+    """
+    import sqlite3
+    try:
+        n = max(1, min(30, int(args[0]))) if args else 10
+    except Exception:
+        n = 10
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        filas = conn.execute(
+            "SELECT id, fecha, hora_inicio, hora_cierre, contrato_tipo, direccion, modo, resultado_pct, motivo_cierre, "
+            "pico_pct, pico_min, peor_pct, peor_min FROM ciclos WHERE cerrado = 1 AND pico_pct IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    finally:
+        conn.close()
+    if not filas:
+        return "Todavía no hay ciclos cerrados con pico registrado (se llena desde la actualización del 14/10)."
+    lineas = [f"📈 <b>Últimos {len(filas)} ciclos cerrados</b> (bruto % del margen)"]
+    for f in filas:
+        res = f["resultado_pct"]
+        lineas.append(
+            f"#{f['id']} {f['fecha'][4:]} {f['hora_inicio']}→{f['hora_cierre']} {f['contrato_tipo']} {f['direccion'][:1]}"
+            f"{' ('+f['modo'][:3]+')' if f['modo'] else ''}: {res:+.1f}% [{f['motivo_cierre']}] "
+            f"| pico {f['pico_pct']:+.1f}% (min {f['pico_min']}) | peor {f['peor_pct']:+.1f}% (min {f['peor_min']})"
+        )
+    return "\n".join(lineas)
+
+
 def procesar_comando(texto: str) -> str:
     partes = texto.strip().split()
     if not partes:
@@ -392,10 +472,16 @@ def procesar_comando(texto: str) -> str:
         return _cmd_ultimas(args)
     elif cmd == "/corregir_historico":
         return _cmd_corregir_historico()
+    elif cmd == "/backup_db":
+        return _cmd_backup_db(args)
+    elif cmd == "/pico":
+        return _cmd_pico(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot BingX — Comandos</b>\n\n"
             "/estado — resumen de hoy\n"
+            "/backup_db — base completa comprimida (.gz); '/backup_db liviano' = sin gates_log\n"
+            "/pico [N] — últimos N ciclos cerrados con su pico y peor momento (bruto % del margen)\n"
             "/pendientes — posiciones abiertas (real + las 3 simulaciones en sombra)\n"
             "/simulaciones [FECHA|todo] — resultados de la estrategia original (sin capital real)\n"
             "/comparar [FECHA|todo] — las 5 estrategias juntas (real V5.0, V5.0 fiel, "

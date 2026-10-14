@@ -836,6 +836,13 @@ def chequeo_riesgo():
                 contrato_tipo = ciclo["contrato_tipo"]
                 symbol = f"{MONEDA}-USD" if contrato_tipo == "COIN-M" else f"{MONEDA}-USDT"
 
+                # 14/10 — registro del pico/peor del ciclo (solo anotar, no decide nada; nunca debe romper el chequeo de riesgo)
+                try:
+                    db.actualizar_extremos_ciclo(
+                        ciclo, gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO))
+                except Exception as e:
+                    print(f"⚠️ registro de extremos del ciclo {ciclo.get('id')}: {e}", flush=True)
+
                 if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO):
                     pnl_margen = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)

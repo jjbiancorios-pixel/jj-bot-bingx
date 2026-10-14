@@ -160,7 +160,11 @@ def init_db():
     for nombre, tipo in [("contrato_tipo", "TEXT"), ("atr_abs", "REAL"),
                          ("hvn_precio", "REAL"), ("salida_parcial_hecha", "INTEGER"),
                          ("intentos_fallidos_entrada", "INTEGER"),
-                         ("modo", "TEXT")]:  # 05/10: "tendencial" (default) o "oscilacion" — switch de fase por ADX(1h)
+                         ("modo", "TEXT"),  # 05/10: "tendencial" (default) o "oscilacion" — switch de fase por ADX(1h)
+                         # 14/10 — extremos del ciclo (resultado BRUTO % del margen, medido con el precio que usa el bot):
+                         # pico = lo mejor que llego a ir, peor = lo peor; *_min = minutos desde la apertura.
+                         ("pico_pct", "REAL"), ("pico_min", "INTEGER"),
+                         ("peor_pct", "REAL"), ("peor_min", "INTEGER")]:
         try:
             cur.execute(f"ALTER TABLE ciclos ADD COLUMN {nombre} {tipo}")
         except Exception:
@@ -322,6 +326,40 @@ def marcar_salida_parcial_hecha(ciclo_id: int):
     conn = _conn()
     cur = conn.cursor()
     cur.execute("UPDATE ciclos SET salida_parcial_hecha = 1 WHERE id = ?", (ciclo_id,))
+    conn.commit()
+    conn.close()
+
+
+def actualizar_extremos_ciclo(ciclo: dict, pnl_pct: float):
+    """
+    14/10 — Guarda el pico (mejor) y el peor resultado bruto del ciclo y en que minuto
+    desde la apertura ocurrio. Solo escribe cuando hay un extremo nuevo (la fila ya
+    trae los previos), asi que casi nunca toca la base. Es solo registro: no cambia
+    ninguna decision.
+    """
+    if pnl_pct is None:
+        return
+    pico = ciclo.get("pico_pct")
+    peor = ciclo.get("peor_pct")
+    nuevo_pico = pico is None or pnl_pct > pico
+    nuevo_peor = peor is None or pnl_pct < peor
+    if not (nuevo_pico or nuevo_peor):
+        return
+    try:
+        inicio = datetime.fromisoformat(ciclo["creado"])
+        minutos = int((datetime.now(TZ_ARG) - inicio).total_seconds() // 60)
+    except Exception:
+        minutos = None
+    sets, params = [], []
+    if nuevo_pico:
+        sets += ["pico_pct = ?", "pico_min = ?"]; params += [round(pnl_pct, 4), minutos]
+        ciclo["pico_pct"] = round(pnl_pct, 4)
+    if nuevo_peor:
+        sets += ["peor_pct = ?", "peor_min = ?"]; params += [round(pnl_pct, 4), minutos]
+        ciclo["peor_pct"] = round(pnl_pct, 4)
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE ciclos SET {', '.join(sets)} WHERE id = ?", params + [ciclo["id"]])
     conn.commit()
     conn.close()
 

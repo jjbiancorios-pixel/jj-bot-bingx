@@ -677,7 +677,7 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
 
         tag_modo = " [Modo Oscilación]" if modo == "oscilacion" else ""
         telegram_cmds.enviar(
-            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.MAX_ENTRADAS}</b> ({direccion}, {contrato_tipo}){tag_modo}\n"
+            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.max_entradas_modo(modo)}</b> ({direccion}, {contrato_tipo}){tag_modo}\n"
             f"Precio: {precio:.2f} | Margen: USD {margen_usd:.2f}\nTP (VPVR): {tp_txt}"
         )
     except Exception as e:
@@ -843,7 +843,7 @@ def chequeo_riesgo():
                 except Exception as e:
                     print(f"⚠️ registro de extremos del ciclo {ciclo.get('id')}: {e}", flush=True)
 
-                if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO):
+                if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO, modo=(ciclo.get("modo") or "tendencial")):
                     pnl_margen = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
                     if bingx_api.orden_fue_exitosa(r):
@@ -922,7 +922,7 @@ def chequeo_riesgo():
                         entradas_previas = db.obtener_entradas(ciclo["id"])
                         precio_ultima_entrada = entradas_previas[-1]["precio"] if entradas_previas else precio_1
                         dispara_siguiente = (
-                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS
+                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS_OSCILACION
                             and gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion(direccion, precio_ultima_entrada, ciclo["atr_abs"], precio_actual)
                         )
                     else:
@@ -1021,7 +1021,9 @@ def chequeo_riesgo():
 def main():
     db.init_db()
     telegram_cmds.inicializar_offset_telegram()
-    telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.")
+    telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.\n"
+                         f"fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
+                         f"DCA {gestion_riesgo.DCA_OSCILACION_ATR_MULT}×ATR, {gestion_riesgo.MAX_ENTRADAS_OSCILACION} entradas.")
 
     hilo_riesgo = threading.Thread(target=chequeo_riesgo, daemon=True)
     hilo_riesgo.start()

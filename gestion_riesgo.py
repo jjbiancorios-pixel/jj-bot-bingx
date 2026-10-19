@@ -43,9 +43,11 @@ NIVELES_ENTRADA_ATR = {
 # (V5.0, sin tocar); si es bajo, desvía el flujo exclusivamente a este
 # módulo. El ADX nunca bloquea operar, solo decide qué lógica maneja
 # el trade (directiva explícita de Juanjo, 05/10).
-ADX_UMBRAL_OSCILACION = 22      # ADX(1h) < esto -> Fase de Materialización (switch a Oscilación)
-RSI_OSCILACION_LARGO_MAX = 32   # RSI(4h) <= esto dispara entrada LARGO en Modo Oscilación
-RSI_OSCILACION_CORTO_MIN = 68   # RSI(4h) >= esto dispara entrada CORTO en Modo Oscilación
+# 19/10 fix22 — Etapa 1 de "relajar entradas" (decisión de Juanjo, backtest ETH 200 días).
+# Valores anteriores (fix21): ADX 22 / RSI 32-68 / DCA 1.5 / 5 entradas. Para volver atrás, restaurar esos 4 valores.
+ADX_UMBRAL_OSCILACION = 30      # ADX(1h) < esto -> Fase de Materialización (switch a Oscilación). Antes 22.
+RSI_OSCILACION_LARGO_MAX = 38   # RSI(4h) <= esto dispara entrada LARGO en Modo Oscilación. Antes 32.
+RSI_OSCILACION_CORTO_MIN = 62   # RSI(4h) >= esto dispara entrada CORTO en Modo Oscilación. Antes 68.
 
 # Separación de DCA del Modo Oscilación: variable LOCAL y ENCAPSULADA,
 # de uso EXCLUSIVO dentro de este modo — NO modifica ni reemplaza
@@ -54,7 +56,16 @@ RSI_OSCILACION_CORTO_MIN = 68   # RSI(4h) >= esto dispara entrada CORTO en Modo 
 # re-entrada requiere que el precio se mueva en contra 1.5×ATR(1h)
 # desde la ÚLTIMA entrada ejecutada (no desde la entrada 1, a
 # diferencia de la tabla tendencial).
-DCA_OSCILACION_ATR_MULT = 1.5
+DCA_OSCILACION_ATR_MULT = 2.0   # 19/10 fix22: separación ampliada, antes 1.5
+
+# 19/10 fix22 — el Modo Oscilación admite hasta 6 entradas (antes 5). El modo tendencial
+# queda en MAX_ENTRADAS = 5 (su tabla NIVELES_ENTRADA_ATR solo llega a la 5ta).
+# El SL (3% de precio desde el promedio = -60% del margen a 20x) rige desde la ÚLTIMA entrada de cada modo.
+MAX_ENTRADAS_OSCILACION = 6
+
+
+def max_entradas_modo(modo: str = "tendencial") -> int:
+    return MAX_ENTRADAS_OSCILACION if modo == "oscilacion" else MAX_ENTRADAS
 
 SL_RETROCESO_LARGO_PCT = -51.6  # V4 (antigua) — precio crudo desde entrada 1
 SL_RETROCESO_CORTO_PCT = 31.0   # V4 (antigua)
@@ -106,14 +117,15 @@ def calcular_pnl_pct_margen(entradas: list, precio_actual: float, direccion: str
     return round(ganancia_usd_total / margen_total * 100, 4)
 
 
-def precio_toca_sl_margen(entradas: list, precio_actual: float, direccion: str, leverage: int) -> bool:
+def precio_toca_sl_margen(entradas: list, precio_actual: float, direccion: str, leverage: int, modo: str = "tendencial") -> bool:
     """
     fix21 — SL solo desde la 5ta entrada ejecutada: con 1 a 4 entradas nunca
     cierra por SL. Con 5 entradas, cierra si el PNL apalancado cae a
     SL_MARGEN_PCT_5TA_ENTRADA (-60% del margen total = 3% de precio desde el
     promedio a 20x).
     """
-    if len(entradas) < MAX_ENTRADAS:
+    # fix22: el SL rige desde la última entrada del modo del ciclo (5 tendencial, 6 oscilación)
+    if len(entradas) < max_entradas_modo(modo):
         return False
     pnl_pct = calcular_pnl_pct_margen(entradas, precio_actual, direccion, leverage)
     return pnl_pct <= SL_MARGEN_PCT_5TA_ENTRADA

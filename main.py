@@ -404,6 +404,34 @@ def evaluar_entrada_v5(moneda: str):
     }
 
 
+
+_ULT_OBS_TG = {"t": 0.0}
+
+def _observar_gatillo_oscilacion(adx, fase):
+    """fix23: solo informa. Nunca abre ni cierra nada."""
+    import time as _t
+    df4h = get_velas_4h(MONEDA, 250)
+    if df4h is None or adx is None:
+        return
+    rsi = float(calc_rsi(df4h["close"], 14).iloc[-1])
+    lo = gestion_riesgo.RSI_OSCILACION_LARGO_MAX
+    hi = gestion_riesgo.RSI_OSCILACION_CORTO_MIN
+    if rsi <= lo:
+        estado = "EN ZONA LARGO"
+    elif rsi >= hi:
+        estado = "EN ZONA CORTO"
+    elif rsi - lo <= hi - rsi:
+        estado = f"faltan {rsi - lo:.1f} pts para LARGO"
+    else:
+        estado = f"faltan {hi - rsi:.1f} pts para CORTO"
+    adx_ok = adx < gestion_riesgo.ADX_UMBRAL_OSCILACION
+    linea = (f"OBS {MONEDA}: ADX1h {adx:.1f} ({'oscilación' if adx_ok else 'tendencial'}), "
+             f"RSI4h {rsi:.1f} [{lo}/{hi}] -> {estado}")
+    print(linea, flush=True)
+    if _t.time() - _ULT_OBS_TG["t"] >= 4 * 3600:
+        _ULT_OBS_TG["t"] = _t.time()
+        telegram_cmds.enviar(f"👀 <b>{MONEDA}</b> — gatillo Oscilación\nADX(1h): {adx:.1f} (umbral &lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}) → {'oscilación' if adx_ok else 'tendencial'}\nRSI(4h): {rsi:.1f} (largo ≤{lo}, corto ≥{hi})\n{estado}")
+
 # ── Modo Oscilación (05/10) — sub-módulo alternativo, NO reemplaza V5.0 ──
 def evaluar_modo_oscilacion(moneda: str):
     """
@@ -706,15 +734,25 @@ def ciclo_seleccion():
     # falta de datos, fail-safe a "tendencial" (el comportamiento de
     # siempre, sin inventar una fase nueva a ciegas). ──
     fase = "tendencial"
+    _adx_obs = None
     try:
         df1h_switch = get_velas_1h(MONEDA, 100)
         if df1h_switch is not None:
             adx_1h_switch = calc_adx(df1h_switch)["adx"]
+            _adx_obs = adx_1h_switch
             if adx_1h_switch < gestion_riesgo.ADX_UMBRAL_OSCILACION:
                 fase = "oscilacion"
                 print(f"MERCADO EN MATERIALIZACIÓN (ADX: {adx_1h_switch:.1f}) -> Cambiando a Modo Oscilación (RSI 4H).", flush=True)
     except Exception as e:
         print(f"Error calculando ADX(1h) para el switch de fase (sigue tendencial): {e}", flush=True)
+
+    # ── fix23 (solo observación, NO cambia ninguna decisión): muestra
+    # ADX(1h) y RSI(4h) de ETH y cuánto falta para el gatillo. Log cada
+    # ciclo; resumen por Telegram cada 4 h. ──
+    try:
+        _observar_gatillo_oscilacion(_adx_obs, fase)
+    except Exception as e:
+        print(f"fix23: error en observación del gatillo (no afecta operación): {e}", flush=True)
 
     # ── V5.0 (PRINCIPAL, 17/09) — real solo si fase == tendencial ──
     try:
@@ -1022,7 +1060,7 @@ def main():
     db.init_db()
     telegram_cmds.inicializar_offset_telegram()
     telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.\n"
-                         f"fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
+                         f"fix23: + observación RSI/ADX cada 4h. fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
                          f"DCA {gestion_riesgo.DCA_OSCILACION_ATR_MULT}×ATR, {gestion_riesgo.MAX_ENTRADAS_OSCILACION} entradas.")
 
     hilo_riesgo = threading.Thread(target=chequeo_riesgo, daemon=True)

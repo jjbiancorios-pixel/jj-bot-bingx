@@ -1,1085 +1,142 @@
-"""
-main.py — Bot BingX (ETH, rediseño V4 — 13/09/2026)
-──────────────────────────────────────────────────────────────
-Basado en "Estrategia Avanzada COIN-M V4.pdf" — cambio profundo
-respecto al diseño anterior.
-
-Reglas clave del documento:
-- EMA200 (4h/diario) define la dirección PERMITIDA: LARGO solo si
-  precio > EMA200, CORTO solo si precio < EMA200.
-- LARGO permitido puede usar colateral ETH (Coin-M) — CORTO SIEMPRE
-  usa USDT-M, nunca colateral cripto (protección lineal).
-- Entrada 1 exige que se den JUNTAS 4 condiciones: EMA200 (dirección
-  permitida), vela grande vs ATR (>2x, en contra de la dirección
-  buscada), RSI (cruce de 30/70 con quiebre de confirmación), y
-  Bollinger (cierre fuera de banda + reingreso en la vela siguiente).
-- Reingresos en múltiplos de ATR (no % fijo) — ver gestion_riesgo.py.
-- TP con VPVR: 0.5% del Nodo de Alto Volumen (HVN) más cercano.
-
-Se mantiene en paralelo, SIN CAPITAL REAL, la simulación de la
-estrategia ORIGINAL (canal/doble-triple techo-piso) — pedido explícito
-de Juanjo para seguir recolectando datos comparativos mientras se
-prueba este nuevo diseño.
-"""
-import math
-import requests
-import pandas as pd
-import numpy as np
-import time
-import threading
-import schedule
+"""main.py — Bot Oscilación SHADOW. Solo observa y registra ciclos simulados (4 configuraciones en paralelo). No opera."""
+import time, traceback
 from datetime import datetime, timezone, timedelta
+import pandas as pd
+import config, db, data, engine, reporte, tg
 
-import db
-import telegram_cmds
-import gestion_riesgo
-import bingx_api
+def log(*a): print(datetime.now(db.TZ_ARG).strftime("%d/%m %H:%M:%S"), *a, flush=True)
 
-TZ_ARG = timezone(timedelta(hours=-3))
-MONEDA = "ETH"
+def procesar_moneda(m):
+    df, fuente = data.velas_cerradas(m)
+    P = engine.prep(df)
+    n = len(df)
+    ult = db.ultima_vela(m)
+    ts_last = str(df.index[-1])
+    if ult is None:
+        # arranque: no se reconstruye el pasado (evita ciclos falsos); se empieza desde la última vela cerrada
+        db.set_ultima_vela(m, ts_last, fuente)
+        for k in config.CONFIGS: db.estado_set(m, k, engine.nuevo_estado())
+        return 0
+    nuevas = [j for j in range(n) if str(df.index[j]) > ult]
+    if not nuevas: return 0
+    if str(df.index[nuevas[0]]) != str(pd.Timestamp(ult) + pd.Timedelta(hours=1)):
+        log(f"⚠️ {m}: hueco entre {ult} y {df.index[nuevas[0]]} — se reinician sus ciclos abiertos sin contarlos")
+        for k in config.CONFIGS: db.estado_set(m, k, engine.nuevo_estado())
+    cerrados = 0
+    for k, cfg in config.CONFIGS.items():
+        st = db.estado_get(m, k) or engine.nuevo_estado()
+        for j in nuevas:
+            c = engine.paso(st, P, j, cfg, config.L_FLUJO)
+            if c:
+                pn = {L: (-100.0 if c['res'] == 'liq' else float(engine.pnl_puntos(c['ent'], c['salida'], c['side'], L, cfg['fee']))) for L in config.L_REPORTE}
+                db.guardar_ciclo(k, m, c, pn[3], pn[5]); cerrados += 1
+                if c['res'] in ('sl', 'liq'):
+                    tg.enviar(f"🔴 SHADOW {k} {m} {'LARGO' if c['side']==1 else 'CORTO'} cerró por {c['res'].upper()} con {c['n_ent']} entradas: {pn[5]:+.1f}% margen a 5x")
+        db.estado_set(m, k, st)
+    db.set_ultima_vela(m, ts_last, fuente)
+    return cerrados
 
+def ciclo_horario():
+    ok = cerrados = 0; fallidas = {}
+    def intentar(mon):
+        nonlocal ok, cerrados
+        try: cerrados += procesar_moneda(mon); ok += 1; fallidas.pop(mon, None); return True
+        except Exception as e: fallidas[mon] = str(e)[:90]; return False
+    for mon in config.MONEDAS:
+        intentar(mon); time.sleep(config.PAUSA_ENTRE_MONEDAS_S)
+    if fallidas:
+        log(f"primera ronda: {len(fallidas)} monedas con error, se reintentan en {config.PAUSA_SEGUNDA_RONDA_S}s")
+        time.sleep(config.PAUSA_SEGUNDA_RONDA_S)
+        for mon in list(fallidas):
+            intentar(mon); time.sleep(config.PAUSA_ENTRE_MONEDAS_S)
+    # contador de pasadas seguidas con fallo por moneda; aviso solo al llegar al umbral (una vez)
+    nuevas_alertas = []
+    for mon in config.MONEDAS:
+        k = "fallos_" + mon
+        if mon in fallidas:
+            n = int(db.meta_get(k, 0)) + 1; db.meta_set(k, n)
+            if n == config.ALERTA_FALLOS_SEGUIDOS: nuevas_alertas.append(f"{mon}: {fallidas[mon]}")
+        elif int(db.meta_get(k, 0)) > 0: db.meta_set(k, 0)
+    if nuevas_alertas:
+        tg.enviar("⚠️ SHADOW: sin datos de BingX en %d pasadas seguidas para:\n%s" % (config.ALERTA_FALLOS_SEGUIDOS, "\n".join(nuevas_alertas[:10])))
+    log(f"ciclo: {ok} monedas ok, {len(fallidas)} con error, {cerrados} ciclos cerrados")
+    if fallidas: log("errores:", " | ".join(f"{k}: {v}" for k, v in list(fallidas.items())[:10]))
+    return ok, len(fallidas), [f"{k}: {v}" for k, v in fallidas.items()]
 
-# ── Datos: cascada Binance → Bybit (ETH, nunca BingX) ───────
-def _velas_binance(symbol, n=250, interval="4h"):
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={n}"
-    r = requests.get(url, timeout=8)
-    data = r.json()
-    if not isinstance(data, list) or len(data) < 30:
-        raise ValueError("binance empty")
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "vol", "ct", "qav", "trades", "tbbav", "tbqav", "ignore"])
-    for c in ["open", "high", "low", "close", "vol"]:
-        df[c] = df[c].astype(float)
-    return df
-
-
-def _velas_bybit(symbol, n=250, interval="240"):
-    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={n}"
-    r = requests.get(url, timeout=8)
-    data = r.json()
-    if data.get("retCode") != 0:
-        raise ValueError("bybit fail")
-    rows = data["result"]["list"]
-    if not rows or len(rows) < 30:
-        raise ValueError("bybit empty")
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "vol", "turnover"])
-    for c in ["open", "high", "low", "close", "vol"]:
-        df[c] = df[c].astype(float)
-    return df.iloc[::-1].reset_index(drop=True)
-
-
-def get_velas_4h(moneda, n=250):
-    symbol = f"{moneda}USDT"
-    for f, kw in ((_velas_binance, {"interval": "4h"}), (_velas_bybit, {"interval": "240"})):
+def recolectar_mstrx():
+    """Recolector aparte (solo lectura). Cualquier error se registra y NO afecta al Shadow."""
+    try:
+        import mstrx_datos
+        avisos = mstrx_datos.recolectar()
         try:
-            df = f(symbol, n, **kw)
-            if df is not None and len(df) >= 210:  # necesita margen para EMA200
-                return df
+            import mstrx_sim
+            nc = mstrx_sim.procesar()
+            if nc: log(f"mstrx_sim: {nc} ciclos cerrados")
         except Exception:
-            continue
-    return None
-
-
-def get_velas_1h(moneda, n=100):
-    symbol = f"{moneda}USDT"
-    for f, kw in ((_velas_binance, {"interval": "1h"}), (_velas_bybit, {"interval": "60"})):
-        try:
-            df = f(symbol, n, **kw)
-            if df is not None and len(df) >= 30:
-                return df
-        except Exception:
-            continue
-    return None
-
-
-def get_velas_15m(moneda, n=100):
-    """17/09 — nuevo para V4.1: ATR/RSI/Bollinger pasan a calcularse en 15min, no 1h."""
-    symbol = f"{moneda}USDT"
-    for f, kw in ((_velas_binance, {"interval": "15m"}), (_velas_bybit, {"interval": "15"})):
-        try:
-            df = f(symbol, n, **kw)
-            if df is not None and len(df) >= 30:
-                return df
-        except Exception:
-            continue
-    return None
-
-
-def get_precio(moneda):
-    try:
-        r = requests.get(f"https://data-api.binance.vision/api/v3/ticker/price?symbol={moneda}USDT", timeout=6)
-        return float(r.json()["price"])
+            log("mstrx_sim ERROR (no afecta al Shadow):", traceback.format_exc()[-400:])
+        if avisos:
+            k = "mstrx_aviso"; hoy = datetime.now(db.TZ_ARG).strftime("%Y%m%d%H")
+            if db.meta_get(k) != hoy[:8]:
+                db.meta_set(k, hoy[:8]); tg.enviar("⚠️ MSTRX datos: " + " | ".join(avisos[:4]))
+        log("mstrx:", "ok" if not avisos else "; ".join(avisos[:3]))
     except Exception:
-        pass
-    try:
-        r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={moneda}USDT", timeout=6)
-        data = r.json()
-        if data.get("retCode") == 0:
-            return float(data["result"]["list"][0]["lastPrice"])
-    except Exception:
-        pass
+        log("mstrx ERROR (no afecta al Shadow):", traceback.format_exc()[-400:])
+
+def manejar(cmd):
+    p = cmd.split(); c = p[0].lower().split("@")[0]
+    if c in ("/estado", "/resumen"):
+        d = None
+        if len(p) > 1 and p[1].isdigit(): d = str(datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=int(p[1])))
+        return reporte.texto_resumen(d, f"últimos {p[1]} días" if d else "acumulado")
+    if c == "/abiertos": return reporte.texto_abiertos()
+    if c == "/csv": tg.enviar_archivo("ciclos_shadow.csv", reporte.csv_ciclos(), "Ciclos cerrados"); return "CSV enviado."
+    if c == "/mstrx":
+        import mstrx_datos; return mstrx_datos.resumen()
+    if c == "/mstrx_res":
+        import mstrx_sim; return mstrx_sim.texto_resumen()
+    if c == "/mstrx_ciclos":
+        import mstrx_sim; tg.enviar_archivo("mstrx_ciclos.csv", mstrx_sim.csv_ciclos(), "Ciclos simulados MSTRX/BTC"); return "CSV de ciclos MSTRX enviado."
+    if c == "/mstrx_csv":
+        import mstrx_datos
+        for par, tf in (("MSTRX_BTC", "15M"), ("MSTRX_BTC", "60M"), ("MSTRX_BTC", "4H"), ("BTC_USDT", "60M"), ("BTC_USDT", "4H")):
+            tg.enviar_archivo(f"{par}_{tf}.csv", mstrx_datos.csv_velas(par, tf), f"{par} {tf}")
+        return "CSV de MSTRX enviados."
+    if c == "/ayuda": return "/resumen [días] · /abiertos · /csv · /mstrx · /mstrx_csv · /mstrx_res · /mstrx_ciclos"
     return None
 
-
-# ── Indicadores ──────────────────────────────────────────────
-def calc_ema(s, p):
-    return s.ewm(span=p).mean()
-
-
-def calc_atr(df, p=14):
-    hl = df["high"] - df["low"]
-    hcp = (df["high"] - df["close"].shift()).abs()
-    lcp = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
-    return tr.rolling(p).mean()
-
-
-def calc_rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean()
-    return 100 - 100 / (1 + g / l.replace(0, np.nan))
-
-
-def calc_bollinger(s, p=20, num_std=2):
-    media = s.rolling(p).mean()
-    desvio = s.rolling(p).std()
-    banda_sup = media + num_std * desvio
-    banda_inf = media - num_std * desvio
-    return banda_sup, banda_inf
-
-
-def calc_adx(df, p=14):
-    """
-    05/10 — ADX, método de Wilder. Reutilizado del Cripto Bot (ya
-    validado ahí). Usado ÚNICAMENTE como switch de fase del Modo
-    Oscilación (ver ciclo_seleccion) — no es un gate de V5.0.
-    """
-    high, low, close = df["high"], df["low"], df["close"]
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr_w = tr.ewm(alpha=1 / p, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / atr_w.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / atr_w.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(alpha=1 / p, adjust=False).mean()
-    return {"adx": float(adx.iloc[-1])}
-
-
-def calcular_vpvr_hvn(df, precio_actual, direccion, n_bins=24):
-    """
-    VPVR simplificado: histograma de volumen por nivel de precio sobre
-    el lookback completo del df. Los "nodos" son máximos locales del
-    histograma. Devuelve el nodo más CERCANO al precio actual, del lado
-    correcto (por encima para LARGO, por debajo para CORTO) — el TP se
-    calcula 0.5% por dentro de ese nodo (gestion_riesgo.calcular_tp_vpvr).
-
-    20/09 FIX: los bins extremos (0 y n_bins-1) antes quedaban
-    SIEMPRE excluidos de poder ser "nodo" (el chequeo de máximo local
-    exigía vecino a los 2 lados). En una posición que viene cayendo
-    fuerte, el volumen más relevante suele concentrarse justo cerca
-    del precio actual — el extremo del rango — dejando el TP sin
-    calcular indefinidamente (encontrado en producción: posición real
-    de ETH en entrada 4/5, sin TP por varios ciclos). Ahora los
-    extremos SÍ pueden ser nodo, comparando contra su único vecino.
-    Además, si de verdad no hay ningún nodo en la dirección correcta,
-    usa el extremo del rango como respaldo — más vale un TP amplio
-    que ninguno.
-    """
-    precios = df["close"]
-    volumenes = df["vol"]
-    precio_min, precio_max = precios.min(), precios.max()
-    if precio_max <= precio_min:
-        return None
-    ancho_bin = (precio_max - precio_min) / n_bins
-    bins_volumen = [0.0] * n_bins
-    for p, v in zip(precios, volumenes):
-        idx = min(int((p - precio_min) / ancho_bin), n_bins - 1)
-        idx = max(idx, 0)
-        bins_volumen[idx] += v
-
-    nodos = []
-    for i in range(n_bins):
-        vol_izq = bins_volumen[i - 1] if i > 0 else -1
-        vol_der = bins_volumen[i + 1] if i < n_bins - 1 else -1
-        if bins_volumen[i] > vol_izq and bins_volumen[i] > vol_der and bins_volumen[i] > 0:
-            precio_nodo = precio_min + (i + 0.5) * ancho_bin
-            nodos.append(precio_nodo)
-
-    candidatos = [n for n in nodos if n > precio_actual] if direccion == "LARGO" else [n for n in nodos if n < precio_actual]
-    if candidatos:
-        return min(candidatos, key=lambda n: abs(n - precio_actual))
-
-    # Respaldo: sin ningún nodo en la dirección correcta -> usar el
-    # extremo del rango como TP amplio, para que la posición nunca
-    # quede sin objetivo definido.
-    if direccion == "LARGO" and precio_max > precio_actual:
-        return precio_max
-    if direccion == "CORTO" and precio_min < precio_actual:
-        return precio_min
-    return None
-
-
-# ── Gate de entrada V4 (ANTIGUA — queda solo para la simulación de comparación) ──
-def evaluar_entrada_v4(moneda: str):
-    df4h = get_velas_4h(moneda, 250)
-    df1h = get_velas_1h(moneda, 100)
-    if df4h is None or df1h is None:
-        return None
-
-    precio = df1h["close"].iloc[-1]
-    ema200 = calc_ema(df4h["close"], 200).iloc[-1]
-    atr_abs = calc_atr(df1h, 14).iloc[-1]
-    rsi_serie = calc_rsi(df1h["close"], 14)
-    rsi_actual = rsi_serie.iloc[-1]
-    banda_sup, banda_inf = calc_bollinger(df1h["close"], 20, 2)
-
-    permitido_largo = precio > ema200
-    permitido_corto = precio < ema200
-    direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
-    if direccion_candidata is None:
-        return None
-
-    ventana_reciente = df1h.iloc[-6:-1]
-
-    if direccion_candidata == "LARGO":
-        cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 2 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobreventa = bool((tramo_reciente < 30).any())
-        paso_rsi = toco_sobreventa and rsi_actual > 30
-        paso_bollinger = bool(df1h["close"].iloc[-2] < banda_inf.iloc[-2] and precio > banda_inf.iloc[-1])
-    else:
-        cuerpos_alcistas = ventana_reciente[ventana_reciente["close"] > ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_alcistas["close"] - cuerpos_alcistas["open"]) > 2 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobrecompra = bool((tramo_reciente > 70).any())
-        paso_rsi = toco_sobrecompra and rsi_actual < 70
-        paso_bollinger = bool(df1h["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
-
-    califico = paso_atr_vela and paso_rsi and paso_bollinger
-    # 17/09: ya NO loguea en gates_log (eso queda reservado para V4.1,
-    # la principal ahora) — esta versión solo alimenta su propia
-    # simulación de comparación.
-    if not califico:
-        return None
-
-    return {
-        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
-        "atr_abs": round(atr_abs, 6), "df4h": df4h,
-    }
-
-
-# ── Gate de entrada V4.1 (NUEVA — principal) ─────────────────
-def evaluar_entrada_v41(moneda: str):
-    """
-    17/09 — Directiva V4.1, reemplaza a V4 como principal:
-    1. ATR/RSI/Bollinger ahora en 15min (antes 1h)
-    2. EMA200 se mantiene aislada en 4h (sin cambios)
-    3. Vela grande: techo bajado a >1.5x ATR (antes 2x), ventana de
-       5 velas de 15min (antes 1h)
-    4. SL cambia a control de margen flotante (-40% del margen total
-       invertido) — ver gestion_riesgo.precio_toca_sl_margen, se aplica
-       en el loop de riesgo, no acá en la entrada.
-    """
-    df4h = get_velas_4h(moneda, 250)
-    df15m = get_velas_15m(moneda, 200)
-    if df4h is None or df15m is None:
-        db.guardar_gates_log(moneda, "SIN_DATOS", 0, 0, 0, 0, False, estrategia="v41")
-        return None
-
-    precio = df15m["close"].iloc[-1]
-    ema200 = calc_ema(df4h["close"], 200).iloc[-1]
-    atr_abs = calc_atr(df15m, 14).iloc[-1]
-    rsi_serie = calc_rsi(df15m["close"], 14)
-    rsi_actual = rsi_serie.iloc[-1]
-    banda_sup, banda_inf = calc_bollinger(df15m["close"], 20, 2)
-
-    permitido_largo = precio > ema200
-    permitido_corto = precio < ema200
-    direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
-    if direccion_candidata is None:
-        db.guardar_gates_log(moneda, "SIN_DIRECCION_CLARA", 0, 0, 0, 0, False, estrategia="v41")
-        return None
-
-    ventana_reciente = df15m.iloc[-6:-1]  # últimas 5 velas de 15min
-
-    if direccion_candidata == "LARGO":
-        cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 1.5 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobreventa = bool((tramo_reciente < 30).any())
-        paso_rsi = toco_sobreventa and rsi_actual > 30
-        paso_bollinger = bool(df15m["close"].iloc[-2] < banda_inf.iloc[-2] and precio > banda_inf.iloc[-1])
-    else:
-        cuerpos_alcistas = ventana_reciente[ventana_reciente["close"] > ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_alcistas["close"] - cuerpos_alcistas["open"]) > 1.5 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobrecompra = bool((tramo_reciente > 70).any())
-        paso_rsi = toco_sobrecompra and rsi_actual < 70
-        paso_bollinger = bool(df15m["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
-
-    califico = paso_atr_vela and paso_rsi and paso_bollinger
-    db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico)
-
-    if not califico:
-        return None
-
-    return {
-        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
-        "atr_abs": round(atr_abs, 6), "df4h": df4h,
-    }
-
-
-# ── Gate de entrada V5.0 (NUEVA — principal, reemplaza a V4.1) ──
-def evaluar_entrada_v5(moneda: str):
-    """
-    17/09 — Directiva V5.0: idéntica a V4.1 (15m, umbral 1,5x ATR, SL
-    por margen -40%, colateral dual en LARGO — ninguno de esos cambia)
-    + 1 gate NUEVO: Filtro BTC-Anchor — BTC también debe estar del
-    mismo lado de SU PROPIA EMA200 (4h), no solo ETH. V4.1 (sin este
-    filtro) queda corriendo sin tocar, como comparación.
-    """
-    df4h = get_velas_4h(moneda, 250)
-    df15m = get_velas_15m(moneda, 200)
-    if df4h is None or df15m is None:
-        db.guardar_gates_log(moneda, "SIN_DATOS", 0, 0, 0, 0, False, estrategia="v5")
-        return None
-
-    precio = df15m["close"].iloc[-1]
-    ema200 = calc_ema(df4h["close"], 200).iloc[-1]
-
-    permitido_largo = precio > ema200
-    permitido_corto = precio < ema200
-    direccion_candidata = "LARGO" if permitido_largo else ("CORTO" if permitido_corto else None)
-    if direccion_candidata is None:
-        db.guardar_gates_log(moneda, "SIN_DIRECCION_CLARA", 0, 0, 0, 0, False, estrategia="v5")
-        return None
-
-    # NUEVO — Filtro BTC-Anchor: BTC también del mismo lado de SU propia EMA200 (4h)
-    df4h_btc = get_velas_4h("BTC", 250)
-    if df4h_btc is None:
-        db.guardar_gates_log(moneda, direccion_candidata, 0, 0, 0, 0, False, estrategia="v5")
-        return None
-    precio_btc = df4h_btc["close"].iloc[-1]
-    ema200_btc = calc_ema(df4h_btc["close"], 200).iloc[-1]
-    btc_alineado = (precio_btc > ema200_btc) if direccion_candidata == "LARGO" else (precio_btc < ema200_btc)
-    if not btc_alineado:
-        db.guardar_gates_log(moneda, direccion_candidata, 0, 0, 0, 0, False, estrategia="v5")
-        return None
-
-    atr_abs = calc_atr(df15m, 14).iloc[-1]
-    rsi_serie = calc_rsi(df15m["close"], 14)
-    rsi_actual = rsi_serie.iloc[-1]
-    banda_sup, banda_inf = calc_bollinger(df15m["close"], 20, 2)
-
-    ventana_reciente = df15m.iloc[-6:-1]
-
-    if direccion_candidata == "LARGO":
-        cuerpos_bajistas = ventana_reciente[ventana_reciente["close"] < ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_bajistas["close"] - cuerpos_bajistas["open"]) > 1.5 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobreventa = bool((tramo_reciente < 30).any())
-        paso_rsi = toco_sobreventa and rsi_actual > 30
-        paso_bollinger = bool(df15m["close"].iloc[-2] < banda_inf.iloc[-2] and precio > banda_inf.iloc[-1])
-    else:
-        cuerpos_alcistas = ventana_reciente[ventana_reciente["close"] > ventana_reciente["open"]]
-        paso_atr_vela = atr_abs > 0 and bool((abs(cuerpos_alcistas["close"] - cuerpos_alcistas["open"]) > 1.5 * atr_abs).any())
-        tramo_reciente = rsi_serie.iloc[-6:-1]
-        toco_sobrecompra = bool((tramo_reciente > 70).any())
-        paso_rsi = toco_sobrecompra and rsi_actual < 70
-        paso_bollinger = bool(df15m["close"].iloc[-2] > banda_sup.iloc[-2] and precio < banda_sup.iloc[-1])
-
-    califico = paso_atr_vela and paso_rsi and paso_bollinger
-    db.guardar_gates_log(moneda, direccion_candidata, True, paso_atr_vela, paso_rsi, paso_bollinger, califico, estrategia="v5")
-
-    if not califico:
-        return None
-
-    return {
-        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
-        "atr_abs": round(atr_abs, 6), "df4h": df4h,
-    }
-
-
-
-_ULT_OBS_TG = {"t": 0.0}
-
-def _observar_gatillo_oscilacion(adx, fase):
-    """fix23: solo informa. Nunca abre ni cierra nada."""
-    import time as _t
-    df4h = get_velas_4h(MONEDA, 250)
-    if df4h is None or adx is None:
-        return
-    rsi = float(calc_rsi(df4h["close"], 14).iloc[-1])
-    lo = gestion_riesgo.RSI_OSCILACION_LARGO_MAX
-    hi = gestion_riesgo.RSI_OSCILACION_CORTO_MIN
-    if rsi <= lo:
-        estado = "EN ZONA LARGO"
-    elif rsi >= hi:
-        estado = "EN ZONA CORTO"
-    elif rsi - lo <= hi - rsi:
-        estado = f"faltan {rsi - lo:.1f} pts para LARGO"
-    else:
-        estado = f"faltan {hi - rsi:.1f} pts para CORTO"
-    adx_ok = adx < gestion_riesgo.ADX_UMBRAL_OSCILACION
-    linea = (f"OBS {MONEDA}: ADX1h {adx:.1f} ({'oscilación' if adx_ok else 'tendencial'}), "
-             f"RSI4h {rsi:.1f} [{lo}/{hi}] -> {estado}")
-    print(linea, flush=True)
-    if _t.time() - _ULT_OBS_TG["t"] >= 4 * 3600:
-        _ULT_OBS_TG["t"] = _t.time()
-        telegram_cmds.enviar(f"👀 <b>{MONEDA}</b> — gatillo Oscilación\nADX(1h): {adx:.1f} (umbral &lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}) → {'oscilación' if adx_ok else 'tendencial'}\nRSI(4h): {rsi:.1f} (largo ≤{lo}, corto ≥{hi})\n{estado}")
-
-# ── Modo Oscilación (05/10) — sub-módulo alternativo, NO reemplaza V5.0 ──
-def evaluar_modo_oscilacion(moneda: str):
-    """
-    Directiva 05/10 ("Modo Oscilación (RSI 4H)"): activado EXCLUSIVAMENTE
-    por el switch de fase en ciclo_seleccion() cuando ADX(1h) <
-    gestion_riesgo.ADX_UMBRAL_OSCILACION (mercado en materialización /
-    rango lateral). No es un gate adicional sobre evaluar_entrada_v5 —
-    es un camino de ejecución totalmente separado, con su propio
-    trigger de entrada (RSI 4H en zona extrema) y su propia regla de
-    DCA (gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion,
-    separada de NIVELES_ENTRADA_ATR). V5.0 sigue intacto para cuando
-    el ADX vuelva a confirmar tendencia.
-    """
-    df4h = get_velas_4h(moneda, 250)
-    df1h = get_velas_1h(moneda, 100)
-    if df4h is None or df1h is None:
-        return None
-
-    precio = df1h["close"].iloc[-1]
-    rsi_4h = calc_rsi(df4h["close"], 14).iloc[-1]
-    atr_1h = calc_atr(df1h, 14).iloc[-1]
-
-    if atr_1h is None or not atr_1h > 0:
-        return None
-
-    if rsi_4h <= gestion_riesgo.RSI_OSCILACION_LARGO_MAX:
-        direccion_candidata = "LARGO"
-    elif rsi_4h >= gestion_riesgo.RSI_OSCILACION_CORTO_MIN:
-        direccion_candidata = "CORTO"
-    else:
-        return None
-
-    return {
-        "moneda": moneda, "direccion": direccion_candidata, "precio_entrada": precio,
-        "atr_abs": round(atr_1h, 6), "df4h": df4h,  # atr_abs acá es ATR(1h), de uso exclusivo del DCA de este modo
-    }
-
-
-# ── Detectores VIEJOS (solo para la simulación, sin capital real) ──
-def detectar_canal(df, lookback=40, tolerancia_pct=0.5):
-    ventana = df.iloc[-lookback:]
-    banda_alta = ventana["high"].max()
-    banda_baja = ventana["low"].min()
-    precio_actual = df["close"].iloc[-1]
-    toques_alta = (ventana["high"] >= banda_alta * (1 - tolerancia_pct / 100)).sum()
-    toques_baja = (ventana["low"] <= banda_baja * (1 + tolerancia_pct / 100)).sum()
-    cerca_de_alta = precio_actual >= banda_alta * (1 - tolerancia_pct / 100)
-    cerca_de_baja = precio_actual <= banda_baja * (1 + tolerancia_pct / 100)
-    if cerca_de_alta and toques_alta >= 2:
-        return {"patron": "canal_techo", "direccion": "CORTO", "tp_objetivo": banda_baja}
-    if cerca_de_baja and toques_baja >= 2:
-        return {"patron": "canal_piso", "direccion": "LARGO", "tp_objetivo": banda_alta}
-    return None
-
-
-def _picos_locales(serie, ventana=3):
-    picos = []
-    for i in range(ventana, len(serie) - ventana):
-        val = serie.iloc[i]
-        if val == max(serie.iloc[i - ventana:i + ventana + 1]):
-            picos.append((i, val))
-    return picos
-
-
-def _valles_locales(serie, ventana=3):
-    valles = []
-    for i in range(ventana, len(serie) - ventana):
-        val = serie.iloc[i]
-        if val == min(serie.iloc[i - ventana:i + ventana + 1]):
-            valles.append((i, val))
-    return valles
-
-
-def detectar_doble_triple_techo(df, lookback=60, tolerancia_pct=1.0):
-    ventana = df.iloc[-lookback:].reset_index(drop=True)
-    picos = _picos_locales(ventana["high"])
-    if len(picos) < 2:
-        return None
-    ultimos_picos = picos[-3:] if len(picos) >= 3 else picos[-2:]
-    alturas = [p[1] for p in ultimos_picos]
-    promedio = sum(alturas) / len(alturas)
-    if max(alturas) / promedio - 1 > tolerancia_pct / 100:
-        return None
-    idx_inicio, idx_fin = ultimos_picos[0][0], ultimos_picos[-1][0]
-    if idx_fin <= idx_inicio:
-        return None
-    cuello = ventana["low"].iloc[idx_inicio:idx_fin + 1].min()
-    precio_actual = df["close"].iloc[-1]
-    if precio_actual < cuello:
-        altura_patron = promedio - cuello
-        tp = cuello - altura_patron
-        nombre = "triple_techo" if len(ultimos_picos) == 3 else "doble_techo"
-        return {"patron": nombre, "direccion": "CORTO", "tp_objetivo": tp}
-    return None
-
-
-def detectar_doble_triple_piso(df, lookback=60, tolerancia_pct=1.0):
-    ventana = df.iloc[-lookback:].reset_index(drop=True)
-    valles = _valles_locales(ventana["low"])
-    if len(valles) < 2:
-        return None
-    ultimos_valles = valles[-3:] if len(valles) >= 3 else valles[-2:]
-    profundidades = [v[1] for v in ultimos_valles]
-    promedio = sum(profundidades) / len(profundidades)
-    if 1 - min(profundidades) / promedio > tolerancia_pct / 100:
-        return None
-    idx_inicio, idx_fin = ultimos_valles[0][0], ultimos_valles[-1][0]
-    if idx_fin <= idx_inicio:
-        return None
-    cuello = ventana["high"].iloc[idx_inicio:idx_fin + 1].max()
-    precio_actual = df["close"].iloc[-1]
-    if precio_actual > cuello:
-        altura_patron = cuello - promedio
-        tp = cuello + altura_patron
-        nombre = "triple_piso" if len(ultimos_valles) == 3 else "doble_piso"
-        return {"patron": nombre, "direccion": "LARGO", "tp_objetivo": tp}
-    return None
-
-
-def analizar_simulacion_original(moneda: str):
-    df = get_velas_4h(moneda, 100)
-    if df is None:
-        return None
-    candidato = (detectar_canal(df) or detectar_doble_triple_techo(df) or detectar_doble_triple_piso(df))
-    if candidato is None:
-        return None
-    precio = df["close"].iloc[-1]
-    return {"moneda": moneda, "direccion": candidato["direccion"], "patron_tipo": candidato["patron"],
-            "precio_entrada": precio, "tp_objetivo_original": candidato["tp_objetivo"]}
-
-
-# ── Apertura de ciclo real — rutea Coin-M o USDT-M según dirección ──
-def abrir_ciclo_real(candidato: dict, modo: str = "tendencial"):
-    """
-    13/09: en LARGO se abren 2 ciclos INDEPENDIENTES y simultáneos —
-    uno con colateral ETH (Coin-M) y otro con colateral USDT (USDT-M),
-    cada uno con su propio capital y sus propias entradas (confirmado
-    por Juanjo — no es un reparto dentro del mismo ciclo, son
-    posiciones separadas). En CORTO, solo USDT-M (regla del documento).
-
-    05/10: `modo` ("tendencial" u "oscilacion") queda guardado en el
-    ciclo para que chequeo_riesgo() sepa qué regla de DCA aplicar en
-    las re-entradas (NIVELES_ENTRADA_ATR vs. la tabla separada del
-    Modo Oscilación).
-    """
-    moneda = candidato["moneda"]
-    direccion = candidato["direccion"]
-
-    tipos_a_abrir = ["COIN-M", "USDT-M"] if direccion == "LARGO" else ["USDT-M"]
-
-    for contrato_tipo in tipos_a_abrir:
-        if db.ciclo_abierto(moneda, contrato_tipo):
-            continue  # ya hay uno de este tipo abierto, no duplicar
-
-        capital = bingx_api.consultar_balance(moneda) if contrato_tipo == "COIN-M" else bingx_api.consultar_balance_usdtm()
-        if not capital or capital <= 0:
-            telegram_cmds.enviar(f"⚠️ No se pudo leer el balance ({contrato_tipo}) para {moneda} — no se abre ese ciclo.")
-            continue
-
-        # 20/09 FIX: antes se creaba el registro en nuestra base ANTES
-        # de intentar la orden real — si la orden fallaba (como pasó
-        # con Coin-M por el bug de contratos), quedaba un ciclo
-        # "fantasma" marcado como abierto, sin ninguna entrada real
-        # detrás. Ahora el registro solo se crea si la entrada 1
-        # realmente se ejecutó en BingX.
-        ciclo_id = db.crear_ciclo(moneda, direccion, contrato_tipo, candidato["precio_entrada"], candidato["atr_abs"], capital, modo=modo)
-        ok = _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, 1, candidato["precio_entrada"], capital, candidato["df4h"], modo=modo)
-        if not ok:
-            db.cerrar_ciclo(ciclo_id, 0.0, "entrada_1_fallida")
-
-
-def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, precio, capital_ciclo, df4h, modo="tendencial"):
-    """
-    20/09 FIX CRÍTICO (encontrado con capital real): 2 bugs reales.
-    1. El leverage nunca se fijaba en la cuenta — solo se asumía en
-       los cálculos internos. La cuenta real estaba en 100x mientras
-       el código asumía 20x, desfasando todo el cálculo de SL/margen.
-    2. Para Coin-M, `capital_ciclo` es el balance en ETH (ej. 0.2),
-       no en dólares — se estaba usando directo como si fuera USD,
-       dando un margen ~13.000 veces más chico de lo real y una
-       cantidad que redondeaba a "0.0" (rechazada por BingX: Coin-M
-       además espera un número ENTERO de contratos, no ETH
-       fraccionario — 1 contrato ETH-USD = 10 USD de nocional).
-    """
-    side = "BUY" if direccion == "LARGO" else "SELL"
-    position_side = "LONG" if direccion == "LARGO" else "SHORT"
-
-    if contrato_tipo == "COIN-M":
-        capital_usd_equivalente = capital_ciclo * precio  # ETH -> USD al precio actual
-        margen_usd = capital_usd_equivalente * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
-        notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
-        # 28/09 — Directiva: truncado estricto hacia abajo (math.floor),
-        # no redondeo (round). Un redondeo hacia arriba puede pedirle a
-        # BingX más contratos de los que el saldo real en ETH cubre —
-        # esto elimina ese caso de rechazo por fondos insuficientes.
-        quantity = max(1, math.floor(notional_usd / gestion_riesgo.VALOR_CONTRATO_COINM_USD))  # entero, mínimo 1
-    else:
-        margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # USDT-M: capital ya está en USD
-        notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
-        quantity = round(notional_usd / precio, 4)  # USDT-M: cantidad fraccionaria de la cripto
-
-    if contrato_tipo == "COIN-M":
-        symbol = f"{moneda}-USD"
-        if n_entrada == 1:
-            # 28/09 — Directiva: el seteo de leverage a 20x pasa a ser
-            # OBLIGATORIO antes de mandar la Entrada 1. Antes, si BingX
-            # no lo confirmaba (code != 0), solo se imprimía un warning
-            # y se seguía igual — dejando abierta la puerta al bug
-            # histórico (cuenta real operando a 100x por defecto).
-            # Ahora, si no se puede confirmar, se aborta ACÁ, sin mandar
-            # ninguna orden real.
-            r_leverage = bingx_api.fijar_leverage(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
-            if r_leverage.get("code") != 0:
-                telegram_cmds.enviar(
-                    f"🚨 <b>{moneda} ({contrato_tipo})</b>: no se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x "
-                    f"antes de la entrada 1 — ABORTADO por seguridad, no se mandó ninguna orden real.\n"
-                    f"<code>{str(r_leverage)[:300]}</code>"
-                )
-                return False
-            # 20/09: margen aislado, a pedido de Juanjo — solo tiene
-            # sentido en la 1ra entrada (con posición ya abierta,
-            # BingX rechaza el cambio de modo; no bloquea la entrada
-            # si falla, solo se reporta).
-            r_margen = bingx_api.fijar_margen_aislado(symbol)
-            if r_margen.get("code") != 0:
-                print(f"⚠️ No se pudo confirmar margen aislado (Coin-M) para {symbol}: {r_margen}", flush=True)
-        resultado = bingx_api.crear_orden(symbol, side, position_side, "MARKET", quantity)
-    else:
-        symbol = f"{moneda}-USDT"
-        if n_entrada == 1:
-            # 28/09 — Directiva: mismo criterio obligatorio que en Coin-M.
-            r_leverage = bingx_api.fijar_leverage_usdtm(symbol, gestion_riesgo.LEVERAGE_FIJO, position_side)
-            if r_leverage.get("code") != 0:
-                telegram_cmds.enviar(
-                    f"🚨 <b>{moneda} ({contrato_tipo})</b>: no se pudo confirmar leverage {gestion_riesgo.LEVERAGE_FIJO}x "
-                    f"antes de la entrada 1 — ABORTADO por seguridad, no se mandó ninguna orden real.\n"
-                    f"<code>{str(r_leverage)[:300]}</code>"
-                )
-                return False
-            r_margen = bingx_api.fijar_margen_aislado_usdtm(symbol)
-            if r_margen.get("code") != 0:
-                print(f"⚠️ No se pudo confirmar margen aislado (USDT-M) para {symbol}: {r_margen}", flush=True)
-        resultado = bingx_api.crear_orden_usdtm(symbol, side, position_side, "MARKET", quantity)
-
-    ok = bingx_api.orden_fue_exitosa(resultado)
-    if not ok:
-        intentos = db.incrementar_intentos_fallidos(ciclo_id)
-        telegram_cmds.enviar(f"⚠️ Falló la entrada {n_entrada} de {moneda} ({direccion}, {contrato_tipo}) — intento {intentos}\n<code>{str(resultado)[:300]}</code>")
-        return False
-
-    db.resetear_intentos_fallidos(ciclo_id)
-
-    # 20/09: extracción robusta de order_id (Juanjo señaló que BingX
-    # puede devolver el orderId en la raíz del diccionario en algunos
-    # casos, no siempre anidado en "data") + toda la escritura a base
-    # protegida, para que un fallo de escritura local no deje la
-    # orden real "huérfana" sin registrar.
-    try:
-        order_id = str(resultado.get("orderId") or resultado.get("data", {}).get("orderId", ""))
-        db.guardar_entrada(ciclo_id, n_entrada, precio, margen_usd, order_id)
-        db.actualizar_ciclo_entrada(ciclo_id, n_entrada)
-
-        hvn = calcular_vpvr_hvn(df4h, precio, direccion)
-        if hvn is not None:
-            _ref_tp = gestion_riesgo.calcular_promedio_ponderado(db.obtener_entradas(ciclo_id)) or precio
-            tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn, _ref_tp)
-            db.actualizar_tp(ciclo_id, hvn, tp_nuevo)
-            tp_txt = f"{tp_nuevo:.2f}"
-        else:
-            tp_txt = "sin nodo de volumen claro todavía"
-
-        tag_modo = " [Modo Oscilación]" if modo == "oscilacion" else ""
-        telegram_cmds.enviar(
-            f"✅ <b>{moneda} entrada {n_entrada}/{gestion_riesgo.max_entradas_modo(modo)}</b> ({direccion}, {contrato_tipo}){tag_modo}\n"
-            f"Precio: {precio:.2f} | Margen: USD {margen_usd:.2f}\nTP (VPVR): {tp_txt}"
-        )
-    except Exception as e:
-        telegram_cmds.enviar(
-            f"🚨 <b>{moneda} entrada {n_entrada} EJECUTADA en BingX pero falló al registrarla localmente</b>\n"
-            f"order_id: {resultado.get('orderId') or resultado.get('data', {}).get('orderId', '?')}\n"
-            f"Error: {e}\nVerificar manualmente la posición real en BingX."
-        )
-        print(f"🚨 Error guardando entrada {n_entrada} de {moneda} (orden SÍ ejecutada en BingX): {e}", flush=True)
-    return True
-
-
-def abrir_simulacion(candidato: dict):
-    db.crear_simulacion(candidato["moneda"], candidato["direccion"], candidato["patron_tipo"],
-                        candidato["precio_entrada"], candidato["tp_objetivo_original"])
-
-
-# ── Ciclo de selección (cada 15 min) ────────────────────────
-def ciclo_seleccion():
-    pausado = db.esta_pausado_global()
-
-    # ── Switch de FASE (05/10) — ADX(1h) decide qué módulo maneja el
-    # trade REAL. No es un gate: no bloquea operar, solo desvía el
-    # flujo. Alto -> sigue V5.0 (tendencial, intacto). Bajo -> se
-    # desvía EXCLUSIVAMENTE al Modo Oscilación. Ante cualquier error o
-    # falta de datos, fail-safe a "tendencial" (el comportamiento de
-    # siempre, sin inventar una fase nueva a ciegas). ──
-    fase = "tendencial"
-    _adx_obs = None
-    try:
-        df1h_switch = get_velas_1h(MONEDA, 100)
-        if df1h_switch is not None:
-            adx_1h_switch = calc_adx(df1h_switch)["adx"]
-            _adx_obs = adx_1h_switch
-            if adx_1h_switch < gestion_riesgo.ADX_UMBRAL_OSCILACION:
-                fase = "oscilacion"
-                print(f"MERCADO EN MATERIALIZACIÓN (ADX: {adx_1h_switch:.1f}) -> Cambiando a Modo Oscilación (RSI 4H).", flush=True)
-    except Exception as e:
-        print(f"Error calculando ADX(1h) para el switch de fase (sigue tendencial): {e}", flush=True)
-
-    # ── fix23 (solo observación, NO cambia ninguna decisión): muestra
-    # ADX(1h) y RSI(4h) de ETH y cuánto falta para el gatillo. Log cada
-    # ciclo; resumen por Telegram cada 4 h. ──
-    try:
-        _observar_gatillo_oscilacion(_adx_obs, fase)
-    except Exception as e:
-        print(f"fix23: error en observación del gatillo (no afecta operación): {e}", flush=True)
-
-    # ── V5.0 (PRINCIPAL, 17/09) — real solo si fase == tendencial ──
-    try:
-        candidato_v5 = evaluar_entrada_v5(MONEDA)
-    except Exception as e:
-        print(f"Error analizando {MONEDA} (V5.0): {e}")
-        candidato_v5 = None
-
-    if candidato_v5 and not pausado and fase == "tendencial":
-        abrir_ciclo_real(candidato_v5, modo="tendencial")
-
-    # ── Modo Oscilación (05/10) — real solo si fase == oscilacion ──
-    try:
-        candidato_oscilacion = evaluar_modo_oscilacion(MONEDA) if fase == "oscilacion" else None
-    except Exception as e:
-        print(f"Error analizando {MONEDA} (Modo Oscilación): {e}")
-        candidato_oscilacion = None
-
-    if candidato_oscilacion and not pausado:
-        abrir_ciclo_real(candidato_oscilacion, modo="oscilacion")
-
-    # ── "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa ──
-    if candidato_v5 and not db.sim_ciclo_abierto("simulaciones_v5_fiel", MONEDA):
-        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v5["direccion"])
-        sim_id = db.sim_crear_ciclo("simulaciones_v5_fiel", MONEDA, candidato_v5["direccion"],
-                                     candidato_v5["precio_entrada"], candidato_v5["atr_abs"], capital_sim)
-        _ejecutar_entrada_simulada("simulaciones_v5_fiel", sim_id, MONEDA, candidato_v5["direccion"],
-                                    1, candidato_v5["precio_entrada"], capital_sim, candidato_v5["df4h"])
-
-    # ── V4.1 (ahora COMPARACIÓN — sin filtro BTC-Anchor) — SIEMPRE recopila ──
-    try:
-        candidato_v41 = evaluar_entrada_v41(MONEDA)
-    except Exception as e:
-        print(f"Error analizando {MONEDA} (V4.1): {e}")
-        candidato_v41 = None
-
-    # ── "V4.1 fiel" — SIEMPRE recopila, sin importar la pausa
-    # (misma señal que la real, réplica exacta) ──
-    if candidato_v41 and not db.sim_ciclo_abierto("simulaciones_v41_fiel", MONEDA):
-        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v41["direccion"])
-        sim_id = db.sim_crear_ciclo("simulaciones_v41_fiel", MONEDA, candidato_v41["direccion"],
-                                     candidato_v41["precio_entrada"], candidato_v41["atr_abs"], capital_sim)
-        _ejecutar_entrada_simulada("simulaciones_v41_fiel", sim_id, MONEDA, candidato_v41["direccion"],
-                                    1, candidato_v41["precio_entrada"], capital_sim, candidato_v41["df4h"])
-
-    # ── V4 (antigua) — SIEMPRE recopila, sin importar la pausa,
-    # para comparar contra V4.1 ──
-    try:
-        candidato_v4 = evaluar_entrada_v4(MONEDA)
-    except Exception as e:
-        print(f"Error analizando {MONEDA} (V4 antigua): {e}")
-        candidato_v4 = None
-
-    if candidato_v4 and not db.sim_ciclo_abierto("simulaciones_v4_antigua", MONEDA):
-        capital_sim = _capital_estimado_para_simulacion(MONEDA, candidato_v4["direccion"])
-        sim_id = db.sim_crear_ciclo("simulaciones_v4_antigua", MONEDA, candidato_v4["direccion"],
-                                     candidato_v4["precio_entrada"], candidato_v4["atr_abs"], capital_sim)
-        _ejecutar_entrada_simulada("simulaciones_v4_antigua", sim_id, MONEDA, candidato_v4["direccion"],
-                                    1, candidato_v4["precio_entrada"], capital_sim, candidato_v4["df4h"])
-
-    # ── Simulación paralela ORIGINAL (canal/doble-triple techo): SIEMPRE corre ──
-    try:
-        sim_candidato = analizar_simulacion_original(MONEDA)
-    except Exception as e:
-        print(f"Error analizando simulación {MONEDA}: {e}")
-        sim_candidato = None
-    if sim_candidato and not db.simulacion_abierta(MONEDA):
-        abrir_simulacion(sim_candidato)
-
-
-def _capital_estimado_para_simulacion(moneda: str, direccion: str) -> float:
-    """17/09 — capital de referencia para las simulaciones (mismo criterio que usaría una apertura real, sin depender de que haya capital real disponible ahora)."""
-    try:
-        if direccion == "LARGO":
-            cap = bingx_api.consultar_balance(moneda)
-        else:
-            cap = bingx_api.consultar_balance_usdtm()
-        return cap if cap else 100.0  # valor de referencia si no se pudo leer balance real
-    except Exception:
-        return 100.0
-
-
-def _ejecutar_entrada_simulada(tabla: str, sim_id: int, moneda: str, direccion: str, n_entrada: int,
-                                precio: float, capital_ciclo: float, df4h):
-    """
-    17/09 — versión SIN capital real de _ejecutar_entrada, para las
-    simulaciones de comparación. 20/09 FIX: mismo problema de unidades
-    que la real — para LARGO, capital_ciclo viene del balance Coin-M
-    (en ETH), hay que convertirlo a USD antes de calcular el margen.
-    """
-    if direccion == "LARGO":
-        capital_usd_equivalente = capital_ciclo * precio
-        margen_usd = capital_usd_equivalente * gestion_riesgo.PCT_MARGEN_POR_ENTRADA
-    else:
-        margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # CORTO: USDT-M, ya en USD
-    db.sim_guardar_entrada(tabla, sim_id, n_entrada, precio, margen_usd)
-    db.sim_actualizar_entrada(tabla, sim_id, n_entrada)
-    hvn = calcular_vpvr_hvn(df4h, precio, direccion)
-    if hvn is not None:
-        tp_nuevo = gestion_riesgo.calcular_tp_vpvr(direccion, hvn, precio)
-        db.sim_actualizar_tp(tabla, sim_id, hvn, tp_nuevo)
-
-
-# ── Chequeo de riesgo — cada 30seg ───────────────────────────
-def chequeo_riesgo():
-    ciclo_n = 0
-    while True:
-        ciclo_n += 1
+def resumen_diario():
+    hoy = datetime.now(db.TZ_ARG).strftime("%Y%m%d")
+    if datetime.now(db.TZ_ARG).hour >= config.HORA_RESUMEN_ARG and db.meta_get("resumen_enviado") != hoy:
+        d = str(datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24))
+        tg.enviar(reporte.texto_resumen(d, "últimas 24h") + "\n\n" + reporte.texto_resumen(None, "acumulado"))
+        tg.enviar_archivo(f"ciclos_shadow_{hoy}.csv", reporte.csv_ciclos(), "Ciclos cerrados (acumulado)")
         try:
-            if ciclo_n % 10 == 1:
-                print(f"🔄 chequeo_riesgo activo (ciclo {ciclo_n})", flush=True)
-
-            for ciclo in db.ciclos_abiertos(MONEDA):
-                precio_actual = get_precio(MONEDA)
-                if precio_actual is None:
-                    continue
-                direccion = ciclo["direccion"]
-                precio_1 = ciclo["precio_entrada_1"]
-                contrato_tipo = ciclo["contrato_tipo"]
-                symbol = f"{MONEDA}-USD" if contrato_tipo == "COIN-M" else f"{MONEDA}-USDT"
-
-                # 14/10 — registro del pico/peor del ciclo (solo anotar, no decide nada; nunca debe romper el chequeo de riesgo)
-                try:
-                    db.actualizar_extremos_ciclo(
-                        ciclo, gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO))
-                except Exception as e:
-                    print(f"⚠️ registro de extremos del ciclo {ciclo.get('id')}: {e}", flush=True)
-
-                if gestion_riesgo.precio_toca_sl_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO, modo=(ciclo.get("modo") or "tendencial")):
-                    pnl_margen = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
-                    r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
-                    if bingx_api.orden_fue_exitosa(r):
-                        db.cerrar_ciclo(ciclo["id"], pnl_margen, "stop_loss_margen")
-                        telegram_cmds.enviar(f"🔴 <b>{MONEDA} SL (V4.1, por margen)</b> ({contrato_tipo}) — ciclo cerrado. PNL: {pnl_margen:+.2f}% del margen")
-                    else:
-                        print(f"⚠️ BingX rechazó el SL de {MONEDA} ({contrato_tipo}): {r}", flush=True)
-                    continue
-
-                # 20/09 FIX: mismo problema que en las simulaciones —
-                # si el TP nunca se calculó, reintentarlo acá en cada
-                # chequeo (antes solo se calculaba al abrir una
-                # entrada nueva, y una posición real podía quedar
-                # ganando sin poder cerrar por TP indefinidamente).
-                if not ciclo["tp_actual"]:
-                    df4h_tp_real = get_velas_4h(MONEDA, 250)
-                    if df4h_tp_real is not None:
-                        hvn_retry_real = calcular_vpvr_hvn(df4h_tp_real, precio_actual, direccion)
-                        if hvn_retry_real is not None:
-                            _ref_retry = gestion_riesgo.calcular_promedio_ponderado(db.obtener_entradas(ciclo["id"])) or precio_actual
-                            tp_retry_real = gestion_riesgo.calcular_tp_vpvr(direccion, hvn_retry_real, _ref_retry)
-                            db.actualizar_tp(ciclo["id"], hvn_retry_real, tp_retry_real)
-                            ciclo["tp_actual"] = tp_retry_real
-
-                if ciclo["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"]):
-                    r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
-                    if bingx_api.orden_fue_exitosa(r):
-                        resultado_pct = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
-                        db.cerrar_ciclo(ciclo["id"], resultado_pct, "tp_vpvr")
-                        neto_est = gestion_riesgo.pnl_neto_estimado_pct(resultado_pct, gestion_riesgo.LEVERAGE_FIJO)
-                        telegram_cmds.enviar(
-                            f"{'🟢' if neto_est > 0 else '🟠'} <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado.\n"
-                            f"Bruto: {resultado_pct:+.2f}% del margen | Neto est. (con comisiones): {neto_est:+.2f}%"
-                        )
-                    else:
-                        print(f"⚠️ BingX rechazó el TP de {MONEDA} ({contrato_tipo}): {r}", flush=True)
-                    continue
-                # 13/09: salida parcial (50% en breakeven del promedio), re-agregada a pedido de Juanjo
-                if ciclo["n_entradas_actuales"] >= gestion_riesgo.ENTRADA_ACTIVA_SALIDA_PARCIAL and not ciclo["salida_parcial_hecha"]:
-                    entradas = db.obtener_entradas(ciclo["id"])
-                    promedio = gestion_riesgo.calcular_promedio_ponderado(entradas)
-                    if promedio and gestion_riesgo.precio_recupero_promedio(direccion, precio_actual, promedio):
-                        notional_total = sum(e["margen_usd"] for e in entradas) * gestion_riesgo.LEVERAGE_FIJO
-                        qty_50pct = round((notional_total / 2) / precio_actual, 4)
-                        position_side = "LONG" if direccion == "LARGO" else "SHORT"
-                        r = bingx_api.cerrar_parcial(symbol, position_side, qty_50pct) if contrato_tipo == "COIN-M" else bingx_api.cerrar_parcial_usdtm(symbol, position_side, qty_50pct)
-                        if bingx_api.orden_fue_exitosa(r):
-                            db.marcar_salida_parcial_hecha(ciclo["id"])
-                            telegram_cmds.enviar(f"🟡 <b>{MONEDA}</b> ({contrato_tipo}): salida parcial (50%) en breakeven del promedio")
-                        else:
-                            print(f"⚠️ BingX rechazó la salida parcial de {MONEDA} ({contrato_tipo}): {r}", flush=True)
-                        continue
-
-                siguiente_n = ciclo["n_entradas_actuales"] + 1
-                intentos_previos = ciclo.get("intentos_fallidos_entrada") or 0
-                if intentos_previos >= 5:
-                    # 20/09: límite de reintentos — sin esto, el bot
-                    # golpeaba a BingX cada 30seg indefinidamente ante
-                    # un fallo persistente (encontrado en producción:
-                    # 4+ fallos seguidos en la entrada 2 de Coin-M sin
-                    # ningún tope). Se detiene y avisa 1 sola vez al
-                    # cruzar el umbral (no en cada ciclo después).
-                    if intentos_previos == 5:
-                        telegram_cmds.enviar(
-                            f"🚨 <b>{MONEDA} ({contrato_tipo})</b>: la entrada {siguiente_n} falló 5 veces seguidas — "
-                            f"dejo de reintentar automáticamente. Revisar manualmente en BingX y usar /cerrar_manual si corresponde."
-                        )
-                        db.incrementar_intentos_fallidos(ciclo["id"])  # pasa a 6, para no repetir el aviso
-                else:
-                    # 05/10: DCA separado por modo del ciclo. "oscilacion"
-                    # usa gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion
-                    # (1.5×ATR(1h) desde la ÚLTIMA entrada) — la tabla
-                    # NIVELES_ENTRADA_ATR de "tendencial" no se toca.
-                    modo_ciclo = ciclo.get("modo") or "tendencial"
-                    if modo_ciclo == "oscilacion":
-                        entradas_previas = db.obtener_entradas(ciclo["id"])
-                        precio_ultima_entrada = entradas_previas[-1]["precio"] if entradas_previas else precio_1
-                        dispara_siguiente = (
-                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS_OSCILACION
-                            and gestion_riesgo.precio_dispara_siguiente_entrada_oscilacion(direccion, precio_ultima_entrada, ciclo["atr_abs"], precio_actual)
-                        )
-                    else:
-                        dispara_siguiente = (
-                            siguiente_n <= gestion_riesgo.MAX_ENTRADAS
-                            and gestion_riesgo.precio_dispara_siguiente_entrada(direccion, precio_1, ciclo["atr_abs"], precio_actual, siguiente_n)
-                        )
-
-                    if dispara_siguiente:
-                        df4h = get_velas_4h(MONEDA, 250)
-                        if df4h is not None:
-                            _ejecutar_entrada(ciclo["id"], MONEDA, direccion, contrato_tipo, siguiente_n, precio_actual, ciclo["capital_ciclo"], df4h, modo=modo_ciclo)
-
-            # ── 17/09: chequeo de las 2 simulaciones de comparación (V4 antigua y V4.1 fiel) ──
-            for tabla_sim, usa_sl_margen in (("simulaciones_v4_antigua", False), ("simulaciones_v41_fiel", True), ("simulaciones_v5_fiel", True)):
-                for sim in db.sim_ciclos_abiertos(tabla_sim, MONEDA):
-                    precio_sim = get_precio(MONEDA)
-                    if precio_sim is None:
-                        continue
-                    direccion_sim = sim["direccion"]
-                    entradas_sim = db.sim_obtener_entradas(tabla_sim, sim["id"])
-
-                    if usa_sl_margen:
-                        cierra_sl = gestion_riesgo.precio_toca_sl_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
-                        resultado_sl = gestion_riesgo.calcular_pnl_pct_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
-                    else:
-                        cierra_sl = gestion_riesgo.precio_toca_sl(direccion_sim, sim["precio_entrada_1"], precio_sim)
-                        resultado_sl = gestion_riesgo.SL_RETROCESO_LARGO_PCT if direccion_sim == "LARGO" else -gestion_riesgo.SL_RETROCESO_CORTO_PCT
-
-                    if cierra_sl:
-                        db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_sl, "stop_loss")
-                        continue
-
-                    # 20/09 FIX: si por algún motivo el TP nunca se
-                    # calculó (bug real de VPVR encontrado en
-                    # producción — posición de ETH en entrada 4/5, sin
-                    # TP por días, ya en ganancia sin poder cerrar),
-                    # reintentarlo ACÁ en cada chequeo — antes solo se
-                    # calculaba al ejecutar una entrada nueva, y una
-                    # posición que deja de sumar entradas (precio
-                    # revierte a favor) se quedaba sin TP para siempre.
-                    if not sim["tp_actual"]:
-                        df4h_tp = get_velas_4h(MONEDA, 250)
-                        if df4h_tp is not None:
-                            hvn_retry = calcular_vpvr_hvn(df4h_tp, precio_sim, direccion_sim)
-                            if hvn_retry is not None:
-                                tp_retry = gestion_riesgo.calcular_tp_vpvr(direccion_sim, hvn_retry, precio_sim)
-                                db.sim_actualizar_tp(tabla_sim, sim["id"], hvn_retry, tp_retry)
-                                sim["tp_actual"] = tp_retry
-
-                    if sim["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion_sim, precio_sim, sim["tp_actual"]):
-                        resultado_tp = gestion_riesgo.calcular_pnl_pct_margen(entradas_sim, precio_sim, direccion_sim, gestion_riesgo.LEVERAGE_FIJO)
-                        db.sim_cerrar_ciclo(tabla_sim, sim["id"], resultado_tp, "tp_vpvr")
-                        continue
-
-                    # 20/09 — salida parcial (50% en breakeven del
-                    # promedio, desde la entrada 4), agregada a las
-                    # simulaciones en sombra — antes solo existía para
-                    # la posición real, así que no se reflejaba acá
-                    # (encontrado al revisar por qué un trade con 4
-                    # entradas no la había ejecutado). PENDIENTE: el
-                    # resultado final todavía no combina el 50%
-                    # cerrado acá con el 50% que sigue corriendo —
-                    # queda para una próxima actualización, igual que
-                    # en la real.
-                    if sim["n_entradas_actuales"] >= gestion_riesgo.ENTRADA_ACTIVA_SALIDA_PARCIAL and not sim["salida_parcial_hecha"]:
-                        promedio_sim = gestion_riesgo.calcular_promedio_ponderado(entradas_sim)
-                        if promedio_sim and gestion_riesgo.precio_recupero_promedio(direccion_sim, precio_sim, promedio_sim):
-                            db.sim_marcar_salida_parcial(tabla_sim, sim["id"])
-                            continue
-
-                    siguiente_n_sim = sim["n_entradas_actuales"] + 1
-                    if siguiente_n_sim <= gestion_riesgo.MAX_ENTRADAS and gestion_riesgo.precio_dispara_siguiente_entrada(direccion_sim, sim["precio_entrada_1"], sim["atr_abs"], precio_sim, siguiente_n_sim):
-                        df4h_sim = get_velas_4h(MONEDA, 250)
-                        if df4h_sim is not None:
-                            _ejecutar_entrada_simulada(tabla_sim, sim["id"], MONEDA, direccion_sim, siguiente_n_sim, precio_sim, sim["capital_ciclo"], df4h_sim)
-
-            sim = db.simulacion_abierta(MONEDA)
-            if sim:
-                precio_actual = get_precio(MONEDA)
-                if precio_actual is not None:
-                    direccion = sim["direccion"]
-                    tocado = (direccion == "LARGO" and precio_actual >= sim["tp_objetivo_original"]) or \
-                             (direccion == "CORTO" and precio_actual <= sim["tp_objetivo_original"])
-                    if tocado:
-                        entrada = sim["precio_entrada"]
-                        resultado_pct = ((precio_actual - entrada) / entrada * 100) if direccion == "LARGO" else ((entrada - precio_actual) / entrada * 100)
-                        db.cerrar_simulacion(sim["id"], resultado_pct)
-                        print(f"ℹ️ Simulación {MONEDA} cerrada (TP figura): {resultado_pct:+.2f}%", flush=True)
-
-        except Exception as e:
-            print(f"⚠️ chequeo_riesgo: {e}", flush=True)
-        time.sleep(30)
-
+            import mstrx_sim; tg.enviar(mstrx_sim.texto_resumen())
+        except Exception: log("resumen mstrx ERROR:", traceback.format_exc()[-300:])
+        db.meta_set("resumen_enviado", hoy)
 
 def main():
-    db.init_db()
-    telegram_cmds.inicializar_offset_telegram()
-    telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.\n"
-                         f"fix23: + observación RSI/ADX cada 4h. fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
-                         f"DCA {gestion_riesgo.DCA_OSCILACION_ATR_MULT}×ATR, {gestion_riesgo.MAX_ENTRADAS_OSCILACION} entradas.")
-
-    hilo_riesgo = threading.Thread(target=chequeo_riesgo, daemon=True)
-    hilo_riesgo.start()
-
-    schedule.every(15).minutes.do(ciclo_seleccion)
-
-    ciclo_principal = 0
+    db.init()
+    log("Bot Oscilación SHADOW arrancando. DB:", config.DB_PATH)
+    ok, fallos, errores = ciclo_horario()
+    tg.enviar(f"🧪 <b>Bot Oscilación SHADOW</b> arrancó (sin dinero, sin órdenes).\nMonedas leídas: {ok}/{len(config.MONEDAS)}. Configs: A, B, C, D en paralelo (D = B + trailing).\n"
+              + ("Con error: " + "; ".join(errores[:8]) if errores else "")
+              + ("\nComandos: /resumen [días] /abiertos /csv" if config.ACEPTA_COMANDOS else "\nSolo envía (resumen diario 21:00 + CSV). Para comandos definí OSC_TELEGRAM_TOKEN."))
+    recolectar_mstrx()
+    proximo = None
     while True:
-        ciclo_principal += 1
         try:
-            schedule.run_pending()
-            telegram_cmds.revisar_updates()
-        except Exception as e:
-            print(f"⚠️ loop principal: {e}", flush=True)
-        if ciclo_principal % 12 == 1:
-            print(f"💓 loop principal activo (ciclo {ciclo_principal})", flush=True)
-        time.sleep(5)
-
+            ahora = datetime.now(timezone.utc)
+            objetivo = ahora.replace(minute=0, second=25, microsecond=0)
+            if objetivo <= ahora: objetivo += timedelta(hours=1)
+            while datetime.now(timezone.utc) < objetivo:
+                for cmd in tg.comandos():
+                    r = manejar(cmd)
+                    if r: tg.enviar(r)
+                time.sleep(3 if config.ACEPTA_COMANDOS else 20)
+            ciclo_horario(); resumen_diario(); recolectar_mstrx()
+        except Exception:
+            log("ERROR en bucle:", traceback.format_exc()[-600:]); time.sleep(30)
 
 if __name__ == "__main__":
     main()

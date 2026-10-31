@@ -15,7 +15,7 @@ a diferencia del diseño anterior, esta versión NO la incluye, para
 seguir la especificación tal cual está.
 """
 
-PCT_MARGEN_POR_ENTRADA = 0.02  # 2% del capital del ciclo, por entrada (documento: "1% o 2%")
+PCT_MARGEN_POR_ENTRADA = 0.025  # 30/10: 2% -> 2,5% del capital del ciclo, por entrada (para volver atrás: 0.02)
 LEVERAGE_FIJO = 20
 VALOR_CONTRATO_COINM_USD = 10  # 20/09: 1 contrato de ETH-USD Coin-M = 10 USD de valor nocional (convención estándar, confirmada por minTradeValue=10 en el propio contrato de BingX)
 MAX_ENTRADAS = 5

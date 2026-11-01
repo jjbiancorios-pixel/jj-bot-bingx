@@ -1056,11 +1056,46 @@ def chequeo_riesgo():
         time.sleep(30)
 
 
+# ── fix24 (01/11): reporte de cierre del día. SOLO informa: no abre ni cierra nada. ──
+HORA_CIERRE_ART = (23, 55)   # hora de cierre del día (ART)
+_ULT_CIERRE = {"fecha": None}
+
+def reporte_cierre_diario():
+    """Lee saldos Coin-M (ETH) y USDT-M, precio de ETH y ciclos abiertos, y los manda
+    por Telegram en una línea fija ('CIERRE|...') para cargar en la planilla de seguimiento."""
+    ahora = datetime.now(TZ_ARG)
+    precio = get_precio(MONEDA)
+    try:
+        coinm = bingx_api.consultar_balance(MONEDA)
+    except Exception as e:
+        coinm = None; print(f"cierre: error saldo Coin-M: {e}", flush=True)
+    try:
+        usdtm = bingx_api.consultar_balance_usdtm()
+    except Exception as e:
+        usdtm = None; print(f"cierre: error saldo USDT-M: {e}", flush=True)
+    try:
+        abiertos = db.ciclos_abiertos(MONEDA)
+        n_ab = len(abiertos)
+        det = ", ".join(f"{c['direccion']} {c['contrato_tipo']} {c['n_entradas_actuales']} ent." for c in abiertos) or "ninguno"
+    except Exception as e:
+        n_ab = "?"; det = "?"; print(f"cierre: error ciclos abiertos: {e}", flush=True)
+    total = (coinm * precio + usdtm) if (coinm is not None and usdtm is not None and precio) else None
+    f = lambda v, d: "?" if v is None else f"{v:.{d}f}"
+    linea = f"CIERRE|{ahora.strftime('%Y-%m-%d')}|{f(precio,2)}|{f(coinm,8)}|{f(usdtm,4)}|{f(total,2)}|{n_ab}"
+    telegram_cmds.enviar(
+        f"📒 <b>Cierre del día {ahora.strftime('%d/%m/%Y')} (ART)</b>\n"
+        f"ETH: {f(precio,2)} USD\nCoin-M: {f(coinm,8)} ETH\nUSDT-M: {f(usdtm,4)} USDT\n"
+        f"Total: {f(total,2)} USD\nCiclos abiertos: {n_ab} ({det})\n\n"
+        f"<code>{linea}</code>\n"
+        f"(formato: CIERRE|fecha|precio ETH|Coin-M ETH|USDT-M|total USD|ciclos abiertos)"
+    )
+
+
 def main():
     db.init_db()
     telegram_cmds.inicializar_offset_telegram()
     telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.\n"
-                         f"fix23: + observación RSI/ADX cada 4h. fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
+                         f"fix24: + cierre diario 23:55 ART. fix23: + observación RSI/ADX cada 4h. fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
                          f"DCA {gestion_riesgo.DCA_OSCILACION_ATR_MULT}×ATR, {gestion_riesgo.MAX_ENTRADAS_OSCILACION} entradas.")
 
     hilo_riesgo = threading.Thread(target=chequeo_riesgo, daemon=True)
@@ -1074,6 +1109,13 @@ def main():
         try:
             schedule.run_pending()
             telegram_cmds.revisar_updates()
+            _ah = datetime.now(TZ_ARG)
+            if (_ah.hour, _ah.minute) >= HORA_CIERRE_ART and _ULT_CIERRE["fecha"] != _ah.date():
+                _ULT_CIERRE["fecha"] = _ah.date()
+                try:
+                    reporte_cierre_diario()
+                except Exception as e:
+                    print(f"fix24: error en reporte de cierre (no afecta operación): {e}", flush=True)
         except Exception as e:
             print(f"⚠️ loop principal: {e}", flush=True)
         if ciclo_principal % 12 == 1:

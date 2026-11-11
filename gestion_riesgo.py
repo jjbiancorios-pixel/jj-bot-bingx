@@ -15,9 +15,30 @@ a diferencia del diseño anterior, esta versión NO la incluye, para
 seguir la especificación tal cual está.
 """
 
-PCT_MARGEN_POR_ENTRADA = 0.030  # 30/10: 2% -> 2,5% del capital del ciclo, por entrada (para volver atrás: 0.02)
+import os as _os
+
+# 11/11 — Parámetros por variable de entorno (Railway). Sin variables, el bot se comporta EXACTAMENTE como antes (ETH, 2,5%).
+PCT_MARGEN_POR_ENTRADA = float(_os.environ.get("MARGEN_POR_ENTRADA", "0.03"))  # 11/11: 2,5% -> 3% (decisión de Juanjo). Antes 30/10: 2% -> 2,5%. 11/11: se puede cambiar con la variable MARGEN_POR_ENTRADA (ej. 0.03125 = +25%)
 LEVERAGE_FIJO = 20
 VALOR_CONTRATO_COINM_USD = 10  # 20/09: 1 contrato de ETH-USD Coin-M = 10 USD de valor nocional (convención estándar, confirmada por minTradeValue=10 en el propio contrato de BingX)
+
+
+def valor_contrato_coinm_usd(moneda: str = "ETH"):
+    """11/11 — valor nocional (USD) de 1 contrato Coin-M de la moneda. ETH-USD = 10 (confirmado). Otras monedas (BTC-USD): SOLO si se
+    configura la variable VALOR_CONTRATO_COINM_USD en Railway (verificado en BingX); si no, devuelve None y el bot NO opera Coin-M."""
+    v = _os.environ.get("VALOR_CONTRATO_COINM_USD")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return VALOR_CONTRATO_COINM_USD if moneda == "ETH" else None
+
+
+# 11/11 — Límites de seguridad del bot (0 = desactivado, comportamiento de siempre). Se activan con variables de entorno.
+PERDIDA_DIARIA_MAX = float(_os.environ.get("PERDIDA_DIARIA_MAX", "0"))   # ej. 0.03: si el capital cae >3% desde el inicio del día (ART), no abre ciclos nuevos hasta el día siguiente
+DD_MAX_PAUSA = float(_os.environ.get("DD_MAX_PAUSA", "0"))               # ej. 0.10: si el capital cae >10% desde su máximo, pausa ciclos nuevos hasta /reanudar
+PROP_MONEDA_OBJETIVO = float(_os.environ.get("PROP_MONEDA_OBJETIVO", "0"))  # ej. 0.40: proporción objetivo del capital en la moneda (Coin-M) para el aviso semanal de reequilibrio (0 = sin aviso)
 MAX_ENTRADAS = 5
 ENTRADA_ACTIVA_SALIDA_PARCIAL = 4  # 13/09: re-agregado a pedido de Juanjo (se había perdido en la reescritura V4)
 

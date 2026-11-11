@@ -36,7 +36,12 @@ import gestion_riesgo
 import bingx_api
 
 TZ_ARG = timezone(timedelta(hours=-3))
-MONEDA = "ETH"
+import os
+MONEDA = os.environ.get("MONEDA", "ETH").upper()   # 11/11: ETH por defecto (sin variable, todo igual que antes). BTC: instancia propia con MONEDA=BTC
+MODO_TENDENCIAL = os.environ.get("MODO_TENDENCIAL", "SI").upper() != "NO"   # NO = no opera el módulo tendencial V5.0 (solo Modo Oscilación). BTC arranca con NO (solo lo simulado está validado)
+TRAILING_ATR = float(os.environ.get("TRAILING_ATR", "0"))   # 0 = sin trailing (TP fijo de siempre). Ej. 1.0: al tocar el TP no cierra; sigue con trailing de 1×ATR(1h) con piso en el TP (solo ciclos de Modo Oscilación)
+_TRAIL = {}   # estado del trailing por ciclo (en memoria; si se reinicia el bot, se reevalúa desde el precio de ese momento)
+SIMULACIONES = os.environ.get("SIMULACIONES", "SI").upper() != "NO"         # NO = no corre las simulaciones paralelas (V5/V4.1/V4/original)
 
 
 # ── Datos: cascada Binance → Bybit (ETH, nunca BingX) ───────
@@ -563,6 +568,80 @@ def analizar_simulacion_original(moneda: str):
             "precio_entrada": precio, "tp_objetivo_original": candidato["tp_objetivo"]}
 
 
+# ── 11/11: límites de seguridad + reequilibrio (TODO desactivado por defecto: sin variables el bot opera igual que antes) ──
+import json
+_AVISOS = {}
+
+def _aviso_limitado(clave, texto, cada_seg=3600):
+    """Manda un aviso por Telegram como mucho una vez cada `cada_seg` por clave (evita spam en bucles de 30 s)."""
+    ahora = time.time()
+    if ahora - _AVISOS.get(clave, 0) >= cada_seg:
+        _AVISOS[clave] = ahora
+        telegram_cmds.enviar(texto)
+
+def _ruta_estado_riesgo():
+    base = os.path.dirname(getattr(db, "DB_PATH", "") or "") or "."
+    return os.path.join(base, f"riesgo_estado_{MONEDA}.json")
+
+def _leer_estado_riesgo():
+    try:
+        with open(_ruta_estado_riesgo(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _guardar_estado_riesgo(st):
+    try:
+        with open(_ruta_estado_riesgo(), "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception as e:
+        print(f"riesgo: no se pudo guardar el estado: {e}", flush=True)
+
+def _capital_total_usd():
+    """(total USD, saldo Coin-M en la moneda, saldo USDT-M, precio) o None si algún dato falta."""
+    precio = get_precio(MONEDA)
+    coinm = bingx_api.consultar_balance(MONEDA)
+    usdtm = bingx_api.consultar_balance_usdtm()
+    if precio is None or coinm is None or usdtm is None:
+        return None
+    return coinm * precio + usdtm, coinm, usdtm, precio
+
+def _limites_ok() -> bool:
+    """True si se puede abrir ciclos nuevos. Con PERDIDA_DIARIA_MAX=0 y DD_MAX_PAUSA=0 (por defecto) devuelve siempre True sin consultar nada.
+    Si no puede leer los saldos, NO bloquea (se registra en el log). El capital se mide con los saldos de las billeteras (no incluye ganancia/pérdida flotante)."""
+    if gestion_riesgo.PERDIDA_DIARIA_MAX <= 0 and gestion_riesgo.DD_MAX_PAUSA <= 0:
+        return True
+    try:
+        r = _capital_total_usd()
+        if r is None:
+            print("riesgo: no se pudieron leer los saldos; no se bloquea.", flush=True)
+            return True
+        eq = r[0]
+        hoy = datetime.now(TZ_ARG).strftime("%Y-%m-%d")
+        st = _leer_estado_riesgo()
+        if st.get("fecha") != hoy:
+            st["fecha"] = hoy
+            st["inicio"] = eq
+        st["pico"] = max(float(st.get("pico", 0) or 0), eq)
+        _guardar_estado_riesgo(st)
+        if gestion_riesgo.DD_MAX_PAUSA > 0 and eq < st["pico"] * (1 - gestion_riesgo.DD_MAX_PAUSA):
+            if not db.esta_pausado_global():
+                db.pausar_todo(f"caída >{gestion_riesgo.DD_MAX_PAUSA*100:.0f}% desde el máximo")
+                telegram_cmds.enviar(
+                    f"🛑 <b>{MONEDA}: PAUSA por caída del capital</b>\nCapital {eq:.2f} USD, máximo {st['pico']:.2f} "
+                    f"(−{(1-eq/st['pico'])*100:.1f}%, límite {gestion_riesgo.DD_MAX_PAUSA*100:.0f}%). No abre ciclos nuevos hasta /reanudar. Los abiertos siguen con sus reglas.")
+            return False
+        if gestion_riesgo.PERDIDA_DIARIA_MAX > 0 and eq < st["inicio"] * (1 - gestion_riesgo.PERDIDA_DIARIA_MAX):
+            _aviso_limitado(f"perdida_diaria_{hoy}",
+                            f"⛔ <b>{MONEDA}: límite de pérdida diaria</b>\nCapital {eq:.2f} USD vs {st['inicio']:.2f} al inicio del día "
+                            f"(−{(1-eq/st['inicio'])*100:.1f}%, límite {gestion_riesgo.PERDIDA_DIARIA_MAX*100:.0f}%). No abre ciclos nuevos hasta mañana.", 86400)
+            return False
+        return True
+    except Exception as e:
+        print(f"riesgo: error en el chequeo de límites (no se bloquea): {e}", flush=True)
+        return True
+
+
 # ── Apertura de ciclo real — rutea Coin-M o USDT-M según dirección ──
 def abrir_ciclo_real(candidato: dict, modo: str = "tendencial"):
     """
@@ -627,11 +706,29 @@ def _ejecutar_entrada(ciclo_id, moneda, direccion, contrato_tipo, n_entrada, pre
         # no redondeo (round). Un redondeo hacia arriba puede pedirle a
         # BingX más contratos de los que el saldo real en ETH cubre —
         # esto elimina ese caso de rechazo por fondos insuficientes.
-        quantity = max(1, math.floor(notional_usd / gestion_riesgo.VALOR_CONTRATO_COINM_USD))  # entero, mínimo 1
+        # 11/11: valor del contrato por moneda (ETH-USD = 10 USD; BTC-USD solo si se configuró VALOR_CONTRATO_COINM_USD) y guarda de tamaño:
+        # si el margen pedido no alcanza ni el 75% de 1 contrato, NO se opera (antes max(1, ...) obligaba a abrir 1 contrato entero, mucho más grande que el margen elegido).
+        valor_contrato = gestion_riesgo.valor_contrato_coinm_usd(moneda)
+        if valor_contrato is None:
+            _aviso_limitado(f"sin_valor_contrato_{moneda}",
+                            f"🚨 <b>{moneda} (COIN-M)</b>: falta la variable VALOR_CONTRATO_COINM_USD (valor de 1 contrato {moneda}-USD en USD, según BingX). "
+                            f"No se mandó ninguna orden real.")
+            return False
+        qty_calc = notional_usd / valor_contrato
+        if qty_calc < 0.75:
+            _aviso_limitado(f"coinm_chico_{moneda}",
+                            f"⚠️ <b>{moneda} (COIN-M)</b>: el margen por entrada (USD {margen_usd:.2f} × {gestion_riesgo.LEVERAGE_FIJO}x = USD {notional_usd:.0f}) "
+                            f"no alcanza para 1 contrato (USD {valor_contrato:.0f}). No se abre el ciclo Coin-M; hace falta más capital en la billetera Coin-M o más margen.")
+            return False
+        quantity = max(1, math.floor(qty_calc))  # entero, mínimo 1
     else:
         margen_usd = capital_ciclo * gestion_riesgo.PCT_MARGEN_POR_ENTRADA  # USDT-M: capital ya está en USD
         notional_usd = margen_usd * gestion_riesgo.LEVERAGE_FIJO
         quantity = round(notional_usd / precio, 4)  # USDT-M: cantidad fraccionaria de la cripto
+        if quantity <= 0:
+            _aviso_limitado(f"usdtm_chico_{moneda}",
+                            f"⚠️ <b>{moneda} (USDT-M)</b>: el margen por entrada (USD {margen_usd:.2f} × {gestion_riesgo.LEVERAGE_FIJO}x) no alcanza para la cantidad mínima. No se abre el ciclo USDT-M.")
+            return False
 
     if contrato_tipo == "COIN-M":
         symbol = f"{moneda}-USD"
@@ -726,6 +823,7 @@ def abrir_simulacion(candidato: dict):
 # ── Ciclo de selección (cada 15 min) ────────────────────────
 def ciclo_seleccion():
     pausado = db.esta_pausado_global()
+    limites_ok = _limites_ok()   # 11/11: con las variables de límites sin configurar devuelve True sin consultar nada
 
     # ── Switch de FASE (05/10) — ADX(1h) decide qué módulo maneja el
     # trade REAL. No es un gate: no bloquea operar, solo desvía el
@@ -761,7 +859,7 @@ def ciclo_seleccion():
         print(f"Error analizando {MONEDA} (V5.0): {e}")
         candidato_v5 = None
 
-    if candidato_v5 and not pausado and fase == "tendencial":
+    if candidato_v5 and not pausado and fase == "tendencial" and MODO_TENDENCIAL and limites_ok:
         abrir_ciclo_real(candidato_v5, modo="tendencial")
 
     # ── Modo Oscilación (05/10) — real solo si fase == oscilacion ──
@@ -771,8 +869,11 @@ def ciclo_seleccion():
         print(f"Error analizando {MONEDA} (Modo Oscilación): {e}")
         candidato_oscilacion = None
 
-    if candidato_oscilacion and not pausado:
+    if candidato_oscilacion and not pausado and limites_ok:
         abrir_ciclo_real(candidato_oscilacion, modo="oscilacion")
+
+    if not SIMULACIONES:
+        return
 
     # ── "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa ──
     if candidato_v5 and not db.sim_ciclo_abierto("simulaciones_v5_fiel", MONEDA):
@@ -906,14 +1007,32 @@ def chequeo_riesgo():
                             db.actualizar_tp(ciclo["id"], hvn_retry_real, tp_retry_real)
                             ciclo["tp_actual"] = tp_retry_real
 
-                if ciclo["tp_actual"] and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"]):
+                # 11/11 — TP con trailing (opcional, TRAILING_ATR>0, solo Modo Oscilación). Al tocar el TP no cierra: sigue el pico y cierra cuando el precio
+                # retrocede TRAILING_ATR×ATR(1h) desde el pico, con piso en el TP (nunca cierra peor que el TP). Sin TRAILING_ATR todo queda igual que antes.
+                tp_cerrar = bool(ciclo["tp_actual"]) and gestion_riesgo.precio_toca_tp(direccion, precio_actual, ciclo["tp_actual"])
+                motivo_tp = "tp_vpvr"
+                if TRAILING_ATR > 0 and ciclo["tp_actual"] and (ciclo.get("modo") or "") == "oscilacion" and ciclo.get("atr_abs"):
+                    est_tr = _TRAIL.get(ciclo["id"])
+                    if est_tr is None and tp_cerrar:
+                        est_tr = _TRAIL[ciclo["id"]] = {"pico": precio_actual}
+                        telegram_cmds.enviar(f"📈 <b>{MONEDA} TP tocado</b> ({contrato_tipo}) — sigue con trailing {TRAILING_ATR:g}×ATR (piso en el TP).")
+                    if est_tr is not None:
+                        est_tr["pico"] = max(est_tr["pico"], precio_actual) if direccion == "LARGO" else min(est_tr["pico"], precio_actual)
+                        dist = TRAILING_ATR * float(ciclo["atr_abs"])
+                        if direccion == "LARGO":
+                            stop_tr = max(float(ciclo["tp_actual"]), est_tr["pico"] - dist); tp_cerrar = precio_actual <= stop_tr
+                        else:
+                            stop_tr = min(float(ciclo["tp_actual"]), est_tr["pico"] + dist); tp_cerrar = precio_actual >= stop_tr
+                        motivo_tp = "tp_trailing"
+                if tp_cerrar:
                     r = bingx_api.cerrar_todas_posiciones(symbol) if contrato_tipo == "COIN-M" else bingx_api.cerrar_todas_posiciones_usdtm(symbol)
                     if bingx_api.orden_fue_exitosa(r):
+                        _TRAIL.pop(ciclo["id"], None)
                         resultado_pct = gestion_riesgo.calcular_pnl_pct_margen(db.obtener_entradas(ciclo["id"]), precio_actual, direccion, gestion_riesgo.LEVERAGE_FIJO)
-                        db.cerrar_ciclo(ciclo["id"], resultado_pct, "tp_vpvr")
+                        db.cerrar_ciclo(ciclo["id"], resultado_pct, motivo_tp)
                         neto_est = gestion_riesgo.pnl_neto_estimado_pct(resultado_pct, gestion_riesgo.LEVERAGE_FIJO)
                         telegram_cmds.enviar(
-                            f"{'🟢' if neto_est > 0 else '🟠'} <b>{MONEDA} TP</b> ({contrato_tipo}) — ciclo cerrado.\n"
+                            f"{'🟢' if neto_est > 0 else '🟠'} <b>{MONEDA} TP{' (trailing)' if motivo_tp == 'tp_trailing' else ''}</b> ({contrato_tipo}) — ciclo cerrado.\n"
                             f"Bruto: {resultado_pct:+.2f}% del margen | Neto est. (con comisiones): {neto_est:+.2f}%"
                         )
                     else:
@@ -1081,22 +1200,57 @@ def reporte_cierre_diario():
         n_ab = "?"; det = "?"; print(f"cierre: error ciclos abiertos: {e}", flush=True)
     total = (coinm * precio + usdtm) if (coinm is not None and usdtm is not None and precio) else None
     f = lambda v, d: "?" if v is None else f"{v:.{d}f}"
-    linea = f"CIERRE|{ahora.strftime('%Y-%m-%d')}|{f(precio,2)}|{f(coinm,8)}|{f(usdtm,4)}|{f(total,2)}|{n_ab}"
+    etq = "CIERRE" if MONEDA == "ETH" else f"CIERRE_{MONEDA}"   # ETH conserva el formato de siempre; otras monedas llevan su etiqueta
+    linea = f"{etq}|{ahora.strftime('%Y-%m-%d')}|{f(precio,2)}|{f(coinm,8)}|{f(usdtm,4)}|{f(total,2)}|{n_ab}"
     telegram_cmds.enviar(
-        f"📒 <b>Cierre del día {ahora.strftime('%d/%m/%Y')} (ART)</b>\n"
-        f"ETH: {f(precio,2)} USD\nCoin-M: {f(coinm,8)} ETH\nUSDT-M: {f(usdtm,4)} USDT\n"
+        f"📒 <b>Cierre del día {ahora.strftime('%d/%m/%Y')} (ART) — {MONEDA}</b>\n"
+        f"{MONEDA}: {f(precio,2)} USD\nCoin-M: {f(coinm,8)} {MONEDA}\nUSDT-M: {f(usdtm,4)} USDT\n"
         f"Total: {f(total,2)} USD\nCiclos abiertos: {n_ab} ({det})\n\n"
         f"<code>{linea}</code>\n"
-        f"(formato: CIERRE|fecha|precio ETH|Coin-M ETH|USDT-M|total USD|ciclos abiertos)"
+        f"(formato: {etq}|fecha|precio {MONEDA}|Coin-M {MONEDA}|USDT-M|total USD|ciclos abiertos)"
     )
+    # 11/11 — domingo: aviso de reequilibrio (SOLO informa; la transferencia la hace Juanjo a mano)
+    try:
+        P = gestion_riesgo.PROP_MONEDA_OBJETIVO
+        if P > 0 and ahora.weekday() == 6 and total and precio:
+            valor_coin = coinm * precio
+            prop = valor_coin / total
+            dif = total * P - valor_coin          # >0: falta moneda; <0: sobra moneda
+            if abs(dif) / total < 0.03:
+                msg = f"ya está dentro de ±3% del objetivo; no hace falta mover nada."
+            elif dif > 0:
+                msg = f"falta moneda: pasar ≈ {dif:.2f} USDT a {MONEDA} (≈ {dif/precio:.6f} {MONEDA}) hacia la billetera Coin-M."
+            else:
+                msg = f"sobra moneda: pasar ≈ {-dif:.2f} USD (≈ {-dif/precio:.6f} {MONEDA}) de la billetera Coin-M a USDT-M."
+            telegram_cmds.enviar(
+                f"⚖️ <b>Reequilibrio semanal — {MONEDA}</b>\nObjetivo {P*100:.0f}% moneda / {(1-P)*100:.0f}% USDT. Hoy: {prop*100:.1f}% / {(1-prop)*100:.1f}%.\n"
+                f"{msg}\nCiclos abiertos: {n_ab}. Conviene mover solo con pocos ciclos abiertos y sin tocar el margen en uso."
+            )
+    except Exception as e:
+        print(f"reequilibrio: error (no afecta operación): {e}", flush=True)
 
 
 def main():
     db.init_db()
     telegram_cmds.inicializar_offset_telegram()
-    telegram_cmds.enviar("🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo ETH.\n"
+    if os.environ.get("REINICIAR_PICO", "").upper() == "SI":   # tras un retiro/depósito de capital: reinicia el máximo y el inicio del día de los límites
+        try:
+            os.remove(_ruta_estado_riesgo())
+        except OSError:
+            pass
+    telegram_cmds.enviar(f"🤖 <b>Bot BingX</b> arrancó — rediseño V4 (13/09/2026). EMA200+ATR+RSI+Bollinger+VPVR. Solo {MONEDA}.\n"
                          f"fix24: + cierre diario 23:55 ART. fix23: + observación RSI/ADX cada 4h. fix22: Modo Oscilación ADX&lt;{gestion_riesgo.ADX_UMBRAL_OSCILACION}, RSI {gestion_riesgo.RSI_OSCILACION_LARGO_MAX}/{gestion_riesgo.RSI_OSCILACION_CORTO_MIN}, "
                          f"DCA {gestion_riesgo.DCA_OSCILACION_ATR_MULT}×ATR, {gestion_riesgo.MAX_ENTRADAS_OSCILACION} entradas.")
+    telegram_cmds.enviar(f"⚙️ <b>{MONEDA}</b>: margen/entrada {gestion_riesgo.PCT_MARGEN_POR_ENTRADA*100:g}% · {gestion_riesgo.LEVERAGE_FIJO}x · "
+                         f"tendencial {'SÍ' if MODO_TENDENCIAL else 'NO'} · simulaciones {'SÍ' if SIMULACIONES else 'NO'} · "
+                         f"pérdida diaria máx. {gestion_riesgo.PERDIDA_DIARIA_MAX*100:g}% · pausa por caída {gestion_riesgo.DD_MAX_PAUSA*100:g}% · "
+                         f"objetivo moneda {gestion_riesgo.PROP_MONEDA_OBJETIVO*100:g}% · trailing {TRAILING_ATR:g}×ATR (0 = apagado) (0 = sin límite/aviso)")
+    if MONEDA != "ETH":   # para verificar a ojo las especificaciones reales del contrato Coin-M de la moneda (solo lectura)
+        try:
+            telegram_cmds.enviar(f"📋 Contrato {MONEDA}-USD (BingX, tal cual lo devuelve la API):\n<code>{str(bingx_api.consultar_contrato(f'{MONEDA}-USD'))[:900]}</code>\n"
+                                 f"Valor de contrato configurado: {gestion_riesgo.valor_contrato_coinm_usd(MONEDA)}")
+        except Exception as e:
+            print(f"contrato: error de consulta: {e}", flush=True)
 
     hilo_riesgo = threading.Thread(target=chequeo_riesgo, daemon=True)
     hilo_riesgo.start()
